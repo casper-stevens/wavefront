@@ -69,6 +69,7 @@
   // don't create audible seams. Reset to 0 to force a re-anchor.
   let playHead = 0;
   let badSince = 0; // audioCtx time the cursor first went off-target (watchdog)
+  let ctxRate = 48000; // audio context's native sample rate (set at join)
   const CHUNK_DUR = FRAMES_PER_CHUNK / SAMPLE_RATE; // 0.02s
 
   // Smoothed offset between the audio clock and performance.now() (seconds):
@@ -250,14 +251,32 @@
     const kind = view.getUint8(0);
     if (kind !== 0x01) return;
 
-    // Convert s16le interleaved stereo PCM -> Float32 planar
+    // Decode s16 stereo and build the AudioBuffer AT THE CONTEXT'S NATIVE RATE,
+    // resampling from 24kHz here in JS. Creating a 24kHz buffer and letting Web
+    // Audio resample every 20ms chunk on playback is expensive on WebKit
+    // (Safari / iOS) and was a stutter source; a cheap linear resample here is
+    // far lighter. Buffer duration stays 20ms either way, so the scheduler math
+    // is unchanged.
     const samples = new Int16Array(buffer, HEADER_BYTES, FRAMES_PER_CHUNK * 2);
-    const audioBuffer = audioCtx.createBuffer(2, FRAMES_PER_CHUNK, SAMPLE_RATE);
+    const outFrames = Math.max(1, Math.round((FRAMES_PER_CHUNK * ctxRate) / SAMPLE_RATE));
+    const audioBuffer = audioCtx.createBuffer(2, outFrames, ctxRate);
     const chL = audioBuffer.getChannelData(0);
     const chR = audioBuffer.getChannelData(1);
-    for (let i = 0; i < FRAMES_PER_CHUNK; i++) {
-      chL[i] = samples[i * 2] / 32768;
-      chR[i] = samples[i * 2 + 1] / 32768;
+    if (outFrames === FRAMES_PER_CHUNK) {
+      for (let i = 0; i < FRAMES_PER_CHUNK; i++) {
+        chL[i] = samples[i * 2] / 32768;
+        chR[i] = samples[i * 2 + 1] / 32768;
+      }
+    } else {
+      const step = SAMPLE_RATE / ctxRate; // input samples per output sample
+      for (let i = 0; i < outFrames; i++) {
+        const src = i * step;
+        const i0 = src | 0;
+        const frac = src - i0;
+        const i1 = i0 + 1 < FRAMES_PER_CHUNK ? i0 + 1 : FRAMES_PER_CHUNK - 1;
+        chL[i] = (samples[i0 * 2] * (1 - frac) + samples[i1 * 2] * frac) / 32768;
+        chR[i] = (samples[i0 * 2 + 1] * (1 - frac) + samples[i1 * 2 + 1] * frac) / 32768;
+      }
     }
 
     const playAt = view.getFloat64(4, true);
@@ -502,6 +521,7 @@
     if (audioCtx.state === "suspended") {
       try { await audioCtx.resume(); } catch (e) { /* ignore */ }
     }
+    ctxRate = audioCtx.sampleRate || 48000; // build buffers at this rate
 
     // iOS/Safari/Firefox pause the AudioContext on audio-session interruptions
     // (a notification chime, a brief route change, backgrounding). That causes a
