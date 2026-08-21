@@ -53,10 +53,10 @@
   let joinPerfMs = 0;   // performance.now() sampled at join
   let joinCtxTime = 0;  // audioContext.currentTime sampled at join
 
-  let offsetSamples = []; // ms, master - client
-  let rttSamples = [];    // ms
   let currentOffset = 0;
   let currentRtt = 0;
+  let minRtt = null;       // rolling minimum RTT baseline (ms)
+  let offsetInit = false;  // has the offset been seeded yet?
   let pingTimer = null;
 
   let scheduledCount = 0;
@@ -68,6 +68,7 @@
   // absolute timestamp, so network-jitter bursts and clock-offset updates
   // don't create audible seams. Reset to 0 to force a re-anchor.
   let playHead = 0;
+  let badSince = 0; // audioCtx time the cursor first went off-target (watchdog)
   const CHUNK_DUR = FRAMES_PER_CHUNK / SAMPLE_RATE; // 0.02s
 
   // Smoothed offset between the audio clock and performance.now() (seconds):
@@ -210,27 +211,32 @@
     const rtt = tRecv - t0;
     const offset = t1 + rtt / 2 - tRecv;
 
-    // Keep the offset paired with its RTT.
-    offsetSamples.push({ offset: offset, rtt: rtt });
-    if (offsetSamples.length > SYNC_SAMPLES) offsetSamples.shift();
-    rttSamples.push(rtt);
-    if (rttSamples.length > SYNC_SAMPLES) rttSamples.shift();
+    // Rolling minimum-RTT baseline: snap down to any new low, leak up slowly so
+    // it adapts to changing network conditions instead of sticking forever to
+    // one lucky ping.
+    if (minRtt === null || rtt < minRtt) minRtt = rtt;
+    else minRtt += Math.min(rtt - minRtt, 0.5);
 
-    // Min-RTT filtering: the ping with the least round-trip suffered the least
-    // queuing, so its offset estimate is the most accurate and least skewed by
-    // path asymmetry. Using it (rather than a median over noisy samples) tightens
-    // absolute agreement between devices, which is what keeps them in sync.
-    let best = offsetSamples[0];
-    for (const s of offsetSamples) if (s.rtt < best.rtt) best = s;
-    currentOffset = best.offset;
-    currentRtt = median(rttSamples);
+    // Only trust the offset from low-queue pings (RTT near the baseline) — a
+    // congested ping's offset is skewed. Fold accepted samples in with a gentle
+    // EMA so the offset is SMOOTH and continuously self-healing. The old
+    // min-over-a-sliding-window approach stepped whenever the best sample aged
+    // out, nudging each device differently — that's what drifted them apart and
+    // only a reload fixed. A smooth estimate holds them together and recovers
+    // on its own.
+    if (rtt <= minRtt + 8) {
+      if (!offsetInit) {
+        currentOffset = offset;
+        offsetInit = true;
+      } else {
+        currentOffset += (offset - currentOffset) * 0.15;
+      }
+    }
+    currentRtt = currentRtt === 0 ? rtt : currentRtt + (rtt - currentRtt) * 0.2;
 
     offsetVal.textContent = currentOffset.toFixed(1) + " ms";
     rttVal.textContent = currentRtt.toFixed(1) + " ms";
-
-    if (offsetSamples.length >= 1) {
-      setStatus("synced", "synced");
-    }
+    if (offsetInit) setStatus("synced", "synced");
   }
 
   // ---------------------------------------------------------------------
@@ -279,16 +285,35 @@
     // stay perfectly contiguous (gapless — no seams on any platform), while a
     // sub-percent rate change smoothly steers the cursor onto the shared clock.
     // Only a genuine underrun or large loss-of-lock triggers a hard re-anchor.
+    // Watchdog: if the cursor sits more than ~35ms off target for a sustained
+    // stretch, the ±0.3% rate-lock can't close it (saturated drift, a wrong
+    // offset lock, or a stuck state after an interruption). Auto-resync — hard
+    // re-anchor AND drop the clock offset so it re-estimates fresh — which is
+    // exactly what a manual reload did, now automatic.
+    const err0 = playHead - targetCtx;
+    if (playHead !== 0 && Math.abs(err0) > 0.035) {
+      if (badSince === 0) badSince = now;
+    } else {
+      badSince = 0;
+    }
+    const watchdogTrip = badSince !== 0 && now - badSince > 2.0;
+
     let rate = 1;
     if (
       playHead === 0 ||
       playHead < now + 0.005 ||               // underrun / first chunk
-      Math.abs(playHead - targetCtx) > 0.2     // lost lock: hard re-anchor
+      Math.abs(playHead - targetCtx) > 0.2 ||  // lost lock: hard re-anchor
+      watchdogTrip                             // sustained off-target: auto-resync
     ) {
       if (playHead !== 0 && playHead < now + 0.005) {
         droppedCount++;
         droppedVal.textContent = String(droppedCount);
       }
+      if (watchdogTrip) {
+        offsetInit = false; // re-estimate the clock offset from fresh pings
+        minRtt = null;
+      }
+      badSince = 0;
       playHead = Math.max(targetCtx, now + 0.005);
     } else {
       // error > 0 → cursor ahead of target (buffer too deep) → play a hair
@@ -374,8 +399,8 @@
     ws.onclose = function () {
       setStatus("dropped", "dropped");
       clearInterval(pingTimer);
-      offsetSamples = [];
-      rttSamples = [];
+      minRtt = null;
+      offsetInit = false;
       playHead = 0; // re-anchor the cursor on reconnect
       ctxPerfK = null;
       if (joined) scheduleReconnect();
@@ -493,6 +518,8 @@
         setStatus("interrupted", "connecting");
         playHead = 0;
         ctxPerfK = null;
+        minRtt = null;
+        offsetInit = false; // re-estimate the clock after the gap
         audioCtx.resume().catch(function () {});
       } else if (st === "running") {
         if (joined && ws && ws.readyState === WebSocket.OPEN) setStatus("synced", "synced");
