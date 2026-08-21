@@ -34,6 +34,7 @@
   const rttVal = document.getElementById("rttVal");
   const scheduledVal = document.getElementById("scheduledVal");
   const droppedVal = document.getElementById("droppedVal");
+  const glitchVal = document.getElementById("glitchVal");
   const muteBtn = document.getElementById("muteBtn");
   const hiddenWarning = document.getElementById("hiddenWarning");
   const hostLabel = document.getElementById("hostLabel");
@@ -60,6 +61,7 @@
 
   let scheduledCount = 0;
   let droppedCount = 0;
+  let glitchCount = 0; // audio-session interruptions (iOS pauses the context)
 
   // Continuous playback cursor (audioContext time of the next chunk to play).
   // Chunks are scheduled back-to-back from here rather than each at its own
@@ -471,6 +473,27 @@
     if (audioCtx.state === "suspended") {
       try { await audioCtx.resume(); } catch (e) { /* ignore */ }
     }
+
+    // iOS/Safari/Firefox pause the AudioContext on audio-session interruptions
+    // (a notification chime, a brief route change, backgrounding). That causes a
+    // short silence that never touches the frame path — so it wouldn't show in
+    // the counters. Detect it: count it, flash the status, force a resume, and
+    // reset the cursor so playback re-anchors cleanly instead of trying to catch
+    // up on stale scheduled buffers.
+    audioCtx.onstatechange = function () {
+      if (!audioCtx) return;
+      const st = audioCtx.state;
+      if (st === "interrupted" || st === "suspended") {
+        glitchCount++;
+        glitchVal.textContent = String(glitchCount);
+        setStatus("interrupted", "connecting");
+        playHead = 0;
+        ctxPerfK = null;
+        audioCtx.resume().catch(function () {});
+      } else if (st === "running") {
+        if (joined && ws && ws.readyState === WebSocket.OPEN) setStatus("synced", "synced");
+      }
+    };
 
     // iOS silent-switch workaround: by default an AudioContext plays in the
     // "ambient" session and is muted by the physical ring/silent switch.
