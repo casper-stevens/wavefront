@@ -161,6 +161,10 @@ pub fn start_capture() -> anyhow::Result<CaptureHandle> {
         // Leftover f32 stereo samples not yet emitted as a full 20ms chunk.
         let mut pending: Vec<f32> = Vec::new();
         let mut scratch: Vec<f32> = Vec::new();
+        // Smooth capture timeline in wall-clock ms (0 = anchor on first chunk).
+        let mut timeline: f64 = 0.0;
+        let mut timeline2: f64 = 0.0;
+        let mut timeline3: f64 = 0.0;
 
         let err_fn = |err| eprintln!("wavefront: capture stream error: {err}");
 
@@ -170,7 +174,7 @@ pub fn start_capture() -> anyhow::Result<CaptureHandle> {
                 {
                     let tx = tx.clone();
                     move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                        handle_input(data, in_channels, in_rate, &start, &tx, &mut pending, &mut scratch);
+                        handle_input(data, in_channels, in_rate, &start, &tx, &mut pending, &mut scratch, &mut timeline);
                     }
                 },
                 err_fn,
@@ -187,7 +191,7 @@ pub fn start_capture() -> anyhow::Result<CaptureHandle> {
                             let f32_data: Vec<f32> =
                                 data.iter().map(|s| *s as f32 / i16::MAX as f32).collect();
                             handle_input(
-                                &f32_data, in_channels, in_rate, &start, &tx, &mut pending2, &mut scratch2,
+                                &f32_data, in_channels, in_rate, &start, &tx, &mut pending2, &mut scratch2, &mut timeline2,
                             );
                         }
                     },
@@ -208,7 +212,7 @@ pub fn start_capture() -> anyhow::Result<CaptureHandle> {
                                 .map(|s| (*s as f32 - 32768.0) / 32768.0)
                                 .collect();
                             handle_input(
-                                &f32_data, in_channels, in_rate, &start, &tx, &mut pending3, &mut scratch3,
+                                &f32_data, in_channels, in_rate, &start, &tx, &mut pending3, &mut scratch3, &mut timeline3,
                             );
                         }
                     },
@@ -249,6 +253,17 @@ pub fn start_capture() -> anyhow::Result<CaptureHandle> {
     })
 }
 
+/// Milliseconds of audio per emitted chunk (a uniform 20ms at TARGET_SAMPLE_RATE).
+const CHUNK_MS: f64 = (CHUNK_FRAMES as f64) / (TARGET_SAMPLE_RATE as f64) * 1000.0;
+
+fn wall_now_ms() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64()
+        * 1000.0
+}
+
 #[allow(clippy::too_many_arguments)]
 fn handle_input(
     data: &[f32],
@@ -258,6 +273,7 @@ fn handle_input(
     tx: &broadcast::Sender<AudioChunk>,
     pending: &mut Vec<f32>,
     scratch: &mut Vec<f32>,
+    timeline_ms: &mut f64,
 ) {
     scratch.clear();
     convert_to_stereo_48k(data, in_channels, in_rate, scratch);
@@ -270,14 +286,18 @@ fn handle_input(
             .iter()
             .map(|s| (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)
             .collect();
-        // MUST be the same clock the server's pong `t1` uses (wall epoch ms):
-        // clients compute play offsets against that clock, and mixing clocks
-        // makes every chunk look infinitely late.
-        let capture_ts_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs_f64()
-            * 1000.0;
+        // Uniform timeline: the OS delivers samples in bursts, so stamping
+        // wall-clock per chunk produces clustered timestamps that jitter the
+        // downstream play schedule and desync devices. Instead advance a smooth
+        // +CHUNK_MS timeline (this chunk IS 20ms of audio), anchored to the wall
+        // clock and only re-synced if it drifts (capture over/underrun). Wall
+        // clock is the same epoch the relay/pongs use, so offsets stay valid.
+        let real_now = wall_now_ms();
+        if *timeline_ms == 0.0 || (real_now - *timeline_ms).abs() > 100.0 {
+            *timeline_ms = real_now;
+        }
+        let capture_ts_ms = *timeline_ms;
+        *timeline_ms += CHUNK_MS;
         let _ = tx.send(AudioChunk { capture_ts_ms, pcm });
     }
 }
