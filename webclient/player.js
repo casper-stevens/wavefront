@@ -394,6 +394,23 @@
       try { await audioCtx.resume(); } catch (e) { /* ignore */ }
     }
 
+    // iOS silent-switch workaround: by default an AudioContext plays in the
+    // "ambient" session and is muted by the physical ring/silent switch. Play
+    // a looping silent <audio> element on this same user gesture — that
+    // promotes WebKit's audio session to "playback", which ignores the switch,
+    // and the AudioContext follows. Harmless on other browsers.
+    try {
+      const el = document.createElement("audio");
+      el.loop = true;
+      el.setAttribute("playsinline", "");
+      // ~0.5s of silence, minimal WAV (44.1k mono, all zero samples).
+      el.src =
+        "data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=";
+      el.volume = 0.001;
+      await el.play().catch(function () {});
+      window.__wf_silence = el; // keep a reference so it isn't GC'd
+    } catch (e) { /* ignore */ }
+
     joinPerfMs = performance.now();
     joinCtxTime = audioCtx.currentTime;
 
