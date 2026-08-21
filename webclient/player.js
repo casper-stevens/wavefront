@@ -61,6 +61,13 @@
   let scheduledCount = 0;
   let droppedCount = 0;
 
+  // Continuous playback cursor (audioContext time of the next chunk to play).
+  // Chunks are scheduled back-to-back from here rather than each at its own
+  // absolute timestamp, so network-jitter bursts and clock-offset updates
+  // don't create audible seams. Reset to 0 to force a re-anchor.
+  let playHead = 0;
+  const CHUNK_DUR = FRAMES_PER_CHUNK / SAMPLE_RATE; // 0.02s
+
   let muted = false;
   let wakeLock = null;
 
@@ -221,17 +228,6 @@
     const kind = view.getUint8(0);
     if (kind !== 0x01) return;
 
-    const playAt = view.getFloat64(4, true);
-
-    const nowMs = performance.now();
-    const localPlayAtMs = playAt - currentOffset;
-
-    if (localPlayAtMs <= nowMs) {
-      droppedCount++;
-      droppedVal.textContent = String(droppedCount);
-      return;
-    }
-
     // Convert s16le interleaved stereo PCM -> Float32 planar
     const samples = new Int16Array(buffer, HEADER_BYTES, FRAMES_PER_CHUNK * 2);
     const audioBuffer = audioCtx.createBuffer(2, FRAMES_PER_CHUNK, SAMPLE_RATE);
@@ -242,9 +238,28 @@
       chR[i] = samples[i * 2 + 1] / 32768;
     }
 
-    const targetCtxTime = joinCtxTime + (localPlayAtMs - joinPerfMs) / 1000;
-    // Guard against scheduling in the past relative to the audio clock.
-    const safeTargetTime = Math.max(targetCtxTime, audioCtx.currentTime + 0.001);
+    // Continuous-cursor scheduling. TCP delivers chunks in order, so we play
+    // them back-to-back from a moving playHead, kept ~buffer_ms ahead of the
+    // audio clock. Jitter is absorbed by that lead; we only re-anchor when the
+    // cursor underruns (buffer starved) or drifts too far ahead (clock skew),
+    // which is a single small reset rather than continuous stutter.
+    const now = audioCtx.currentTime;
+    const bufferSec = Math.max(0.1, (currentConfig.buffer_ms || 500) / 1000);
+
+    if (playHead < now + CHUNK_DUR) {
+      // First chunk, or the buffer ran dry: re-anchor with full lead.
+      if (playHead !== 0) {
+        droppedCount++;
+        droppedVal.textContent = String(droppedCount);
+      }
+      playHead = now + bufferSec;
+    } else if (playHead > now + bufferSec * 2 + 0.25) {
+      // Cursor drifted too far ahead (slow DAC / accumulated skew): pull back.
+      playHead = now + bufferSec;
+    }
+
+    const startAt = playHead;
+    playHead += CHUNK_DUR;
 
     const source = audioCtx.createBufferSource();
     source.buffer = audioBuffer;
@@ -258,7 +273,7 @@
     };
 
     try {
-      source.start(safeTargetTime);
+      source.start(startAt);
     } catch (e) {
       scheduledCount = Math.max(0, scheduledCount - 1);
       scheduledVal.textContent = String(scheduledCount);
@@ -320,6 +335,7 @@
       clearInterval(pingTimer);
       offsetSamples = [];
       rttSamples = [];
+      playHead = 0; // re-anchor the cursor on reconnect
       if (joined) scheduleReconnect();
     };
 
