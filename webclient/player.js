@@ -395,6 +395,28 @@
     }
   });
 
+  // Build a valid silent WAV data URL (8kHz mono, `secs` of zero samples).
+  // A real, non-empty payload is important — a zero-length WAV can make iOS
+  // never fire load/play events.
+  function makeSilentWavUrl(secs) {
+    const rate = 8000;
+    const n = Math.floor(rate * secs);
+    const dataLen = n * 2; // 16-bit mono
+    const buf = new ArrayBuffer(44 + dataLen);
+    const dv = new DataView(buf);
+    const w = function (off, s) { for (let i = 0; i < s.length; i++) dv.setUint8(off + i, s.charCodeAt(i)); };
+    w(0, "RIFF"); dv.setUint32(4, 36 + dataLen, true); w(8, "WAVE");
+    w(12, "fmt "); dv.setUint32(16, 16, true); dv.setUint16(20, 1, true);
+    dv.setUint16(22, 1, true); dv.setUint32(24, rate, true);
+    dv.setUint32(28, rate * 2, true); dv.setUint16(32, 2, true); dv.setUint16(34, 16, true);
+    w(36, "data"); dv.setUint32(40, dataLen, true);
+    // samples already zero
+    let bin = "";
+    const bytes = new Uint8Array(buf);
+    for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+    return "data:audio/wav;base64," + btoa(bin);
+  }
+
   // ---------------------------------------------------------------------
   // Join
   // ---------------------------------------------------------------------
@@ -411,19 +433,20 @@
     }
 
     // iOS silent-switch workaround: by default an AudioContext plays in the
-    // "ambient" session and is muted by the physical ring/silent switch. Play
-    // a looping silent <audio> element on this same user gesture — that
-    // promotes WebKit's audio session to "playback", which ignores the switch,
-    // and the AudioContext follows. Harmless on other browsers.
+    // "ambient" session and is muted by the physical ring/silent switch.
+    // Playing an <audio> element on this same user gesture promotes WebKit's
+    // audio session to "playback", which ignores the switch. Fire-and-forget —
+    // must NOT be awaited: on iOS a media element can leave play()'s promise
+    // pending indefinitely, which previously stalled the whole join.
     try {
       const el = document.createElement("audio");
       el.loop = true;
       el.setAttribute("playsinline", "");
-      // ~0.5s of silence, minimal WAV (44.1k mono, all zero samples).
-      el.src =
-        "data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=";
-      el.volume = 0.001;
-      await el.play().catch(function () {});
+      // 1s of real (silent) 8kHz mono PCM so the element actually loads/plays.
+      el.src = makeSilentWavUrl(1.0);
+      el.volume = 0.01;
+      const p = el.play();
+      if (p && p.catch) p.catch(function () {});
       window.__wf_silence = el; // keep a reference so it isn't GC'd
     } catch (e) { /* ignore */ }
 
