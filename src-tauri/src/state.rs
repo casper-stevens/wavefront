@@ -218,10 +218,13 @@ impl AppState {
             Mode::RelayHost => self.relay_url.clone(),
             _ => None,
         };
-        // Weak-network heuristic: any measured client RTT above 60 ms.
+        // Weak-network heuristic. Over a relay every device talks to a
+        // datacenter, so tens-of-ms RTTs are normal — only flag genuinely poor
+        // links. On a direct LAN, anything above ~60ms is a real problem.
+        let rtt_limit = if self.mode == Mode::RelayHost { 220.0 } else { 60.0 };
         let wifi_ok = clients
             .iter()
-            .all(|c| c.latency_ms <= 0.0 || c.latency_ms < 60.0);
+            .all(|c| c.latency_ms <= 0.0 || c.latency_ms < rtt_limit);
         StateView {
             mode: self.mode,
             clients,

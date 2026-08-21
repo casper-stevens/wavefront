@@ -15,7 +15,7 @@
   const FRAME_BYTES = HEADER_BYTES + PAYLOAD_BYTES;
   const Q_BUTTERWORTH = 0.70710678;
   const SYNC_SAMPLES = 15;
-  const PING_INTERVAL_MS = 2000;
+  const PING_INTERVAL_MS = 500; // frequent pings sharpen the min-RTT offset estimate
   const RECONNECT_MIN_MS = 1000;
   const RECONNECT_MAX_MS = 10000;
 
