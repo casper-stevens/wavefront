@@ -95,6 +95,60 @@
   let muted = false;
   let wakeLock = null;
 
+  // Auto-mute-on-drift: a speaker that can't trust its own sync FADES TO SILENCE
+  // rather than playing out-of-phase audio (one out-of-sync speaker echo-ruins
+  // the whole room; a silent one costs nothing). Driven by the Kalman filter's
+  // own confidence (offset covariance), network jitter, corrections, and
+  // interruptions. Fades hide the mute/unmute and also cover hard re-anchors.
+  let syncReliable = true;
+  let reliableSinceCtx = 0;   // audioCtx time healthy conditions began
+  let unreliableUntilCtx = 0; // hold muted at least until this ctx time
+
+  function updateOutputGain() {
+    if (!muteGain || !audioCtx) return;
+    const target = muted || !syncReliable ? 0 : 1;
+    const t = audioCtx.currentTime;
+    muteGain.gain.cancelScheduledValues(t);
+    muteGain.gain.setValueAtTime(muteGain.gain.value, t);
+    // ~150ms fade (setTargetAtTime settles in ~3 time constants).
+    muteGain.gain.setTargetAtTime(target, t, 0.05);
+  }
+
+  // Called by the scheduler each chunk to (un)mute based on live confidence.
+  function updateReliability(nowCtx) {
+    const jitter = currentRtt - (minRtt || 0);
+    const confident =
+      offsetInit && Math.sqrt(kfP00) < 10 && jitter < 100;
+    const healthy = confident && nowCtx >= unreliableUntilCtx;
+    if (healthy) {
+      if (reliableSinceCtx === 0) reliableSinceCtx = nowCtx;
+      if (!syncReliable && nowCtx - reliableSinceCtx > 0.3) {
+        syncReliable = true;
+        updateOutputGain();
+        if (joined) setStatus("synced", "synced");
+      }
+    } else {
+      reliableSinceCtx = 0;
+      if (syncReliable) {
+        syncReliable = false;
+        updateOutputGain();
+        if (joined) setStatus("resyncing", "connecting");
+      }
+    }
+  }
+
+  // Mark the sync untrustworthy for at least `sec` (used around corrections and
+  // interruptions) so output ducks out and back smoothly.
+  function markUnreliable(sec) {
+    if (!audioCtx) return;
+    unreliableUntilCtx = Math.max(unreliableUntilCtx, audioCtx.currentTime + sec);
+    if (syncReliable) {
+      syncReliable = false;
+      updateOutputGain();
+      if (joined) setStatus("resyncing", "connecting");
+    }
+  }
+
   let currentConfig = { role: "full", pan: "mid", gain: 1, crossover_hz: 2000, buffer_ms: 250 };
 
   // ---- DSP graph nodes (built once, rewired on config change) ----
@@ -392,6 +446,9 @@
         offsetInit = false; // re-estimate the clock offset from fresh pings
         minRtt = null;
       }
+      // Any hard correction means we're momentarily NOT trustworthy: duck the
+      // output so the jump is silent and we don't echo while re-locking.
+      if (playHead !== 0) markUnreliable(0.4);
       badSince = 0;
       playHead = Math.max(targetCtx, now + 0.005);
     } else {
@@ -401,6 +458,9 @@
       const error = playHead - targetCtx;
       rate = Math.max(0.997, Math.min(1.003, 1 + 0.5 * error));
     }
+
+    // Update auto-mute confidence each chunk (fades in once locked, out on drift).
+    updateReliability(now);
 
     const startAt = playHead;
     playHead += CHUNK_DUR / rate; // buffer occupies CHUNK_DUR/rate of real time
@@ -482,6 +542,7 @@
       offsetInit = false;
       playHead = 0; // re-anchor the cursor on reconnect
       ctxPerfK = null;
+      markUnreliable(1.0); // silent until re-synced after reconnect
       if (joined) scheduleReconnect();
     };
 
@@ -513,9 +574,7 @@
 
   muteBtn.addEventListener("click", function () {
     muted = !muted;
-    if (muteGain && audioCtx) {
-      muteGain.gain.setValueAtTime(muted ? 0 : 1, audioCtx.currentTime);
-    }
+    updateOutputGain();
     muteBtn.textContent = muted ? "Unmute" : "Mute";
     muteBtn.classList.toggle("muted", muted);
   });
@@ -600,9 +659,10 @@
         ctxPerfK = null;
         minRtt = null;
         offsetInit = false; // re-estimate the clock after the gap
+        markUnreliable(1.0); // stay silent until re-locked
         audioCtx.resume().catch(function () {});
       } else if (st === "running") {
-        if (joined && ws && ws.readyState === WebSocket.OPEN) setStatus("synced", "synced");
+        // reliability (and status) will recover via updateReliability once locked
       }
     };
 
