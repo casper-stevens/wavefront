@@ -68,6 +68,13 @@
   let playHead = 0;
   const CHUNK_DUR = FRAMES_PER_CHUNK / SAMPLE_RATE; // 0.02s
 
+  // Smoothed offset between the audio clock and performance.now() (seconds):
+  // ctxTime ≈ perfMs/1000 + ctxPerfK. Reading audioContext.currentTime raw each
+  // chunk is noisy on platforms where it advances in coarse steps (Linux /
+  // Firefox), which jitters the play target; low-passing it keeps the target
+  // stable. null until the first chunk anchors it; reset with playHead.
+  let ctxPerfK = null;
+
   let muted = false;
   let wakeLock = null;
 
@@ -258,8 +265,13 @@
     // and recomputed live each chunk so it also absorbs perf/audio-clock skew.
     const now = audioCtx.currentTime;
     const nowMs = performance.now();
+    // Low-pass the audio-vs-perf clock offset so a coarse currentTime doesn't
+    // jitter the target (this was the Linux/Firefox stutter).
+    const kInstant = now - nowMs / 1000;
+    if (ctxPerfK === null) ctxPerfK = kInstant;
+    else ctxPerfK += (kInstant - ctxPerfK) * 0.05;
     const localPlayAtMs = playAt - currentOffset;
-    const targetCtx = now + (localPlayAtMs - nowMs) / 1000;
+    const targetCtx = localPlayAtMs / 1000 + ctxPerfK;
 
     if (
       playHead === 0 ||
@@ -356,6 +368,7 @@
       offsetSamples = [];
       rttSamples = [];
       playHead = 0; // re-anchor the cursor on reconnect
+      ctxPerfK = null;
       if (joined) scheduleReconnect();
     };
 
