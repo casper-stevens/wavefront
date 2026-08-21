@@ -62,3 +62,53 @@ Commands (invoke): `start_master`, `stop_master`, `set_client_config{id,role,pan
 Event (backend → UI): `wavefront://state` with the full serialized state
 (mode, clients list with id/name/kind/latency/config, capture source label,
 warnings) — emitted on every change and at 1 Hz.
+
+---
+
+# Relay extension (v1)
+
+For networks that block device-to-device traffic (public/guest Wi-Fi with
+client isolation), the master does not serve children directly. Instead a
+**relay** runs on a public host; the master uploads one stream to it and the
+relay fans that stream out to every child. Because every side only ever talks
+*outward* to the relay, LAN isolation never applies.
+
+Key fact this exploits: the master already sends **byte-identical** full-range
+PCM to every child (all DSP is client-side). So the relay broadcasts one audio
+stream to everyone; only the small per-child control messages differ.
+
+## Endpoints (served by the relay)
+
+- `GET /`      — the browser speaker client (same webclient assets).
+- `GET /ws`    — a child subscriber (native app or browser). From the child's
+                 point of view the relay behaves exactly like a master: the
+                 child-facing protocol above is unchanged.
+- `GET /source`— the master's uplink (exactly one active source).
+
+## Clock authority
+
+The **relay** is the clock authority for children (not the master). The relay
+answers child `ping` with its own monotonic ms clock, and stamps each outgoing
+audio chunk `play_at = relay_now_at_forward + buffer_ms`. This removes any
+clock coupling between master and relay — the master→relay hop only needs to
+deliver audio, not stay clock-synced.
+
+## Master uplink (`/source`) messages
+
+Master → relay:
+- `{"type":"source_hello","buffer_ms":<u32>,"crossover_hz":<f32>}` — first msg.
+- binary audio frames — same layout as the child protocol, but the relay
+  **ignores** the incoming `play_at` and re-stamps on forward.
+- `{"type":"set_config","id":<u32>,"role":..,"pan":..,"gain":..}` — assign one
+  child's role/pan/gain. Relay stores it and forwards a `config` to that child.
+- `{"type":"set_crossover","hz":<f32>}` — relay forwards `config` to all.
+
+Relay → master:
+- `{"type":"child_joined","id":<u32>,"name":<string>,"kind":"native"|"browser"}`
+- `{"type":"child_left","id":<u32>}`
+- `{"type":"child_latency","id":<u32>,"latency_ms":<f64>}`
+- `{"type":"roster","children":[{id,name,kind,latency_ms,role,pan,gain}]}` — 1 Hz.
+
+The master keeps its normal client registry and UI, populated from these
+messages instead of from local socket connections. Setting a child's config in
+the UI sends `set_config`/`set_crossover` up to the relay.

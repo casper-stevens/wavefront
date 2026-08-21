@@ -4,10 +4,12 @@
 // or in a plain browser for demoing (mock mode, using sample data modeled on the
 // mockup at spotify_sync/mockup/wavefront.html).
 //
-// Command surface (see PROTOCOL.md "Master UI <-> backend"):
-//   invoke: start_master, stop_master, set_client_config{id,role,pan,gain},
-//           set_crossover{hz}, set_master_volume{v}, set_master_plays{on},
-//           start_client{addr}, stop_client, get_status
+// Command surface (see PROTOCOL.md "Master UI <-> backend" and the "Relay
+// extension (v1)" appendix):
+//   invoke: start_master, start_relay_host{relay}, stop_master,
+//           set_client_config{id,role,pan,gain}, set_crossover{hz},
+//           set_master_volume{v}, set_master_plays{on}, start_client{addr},
+//           stop_client, get_status
 //   event:  "wavefront://state" -> full serialized state, emitted on every
 //           change and at 1 Hz.
 //
@@ -15,8 +17,9 @@
 // clients list with id/name/kind/latency/config, capture source label,
 // warnings"). We use:
 // {
-//   mode: "idle" | "master" | "client",
-//   addr: "192.168.1.23:8927",           // LAN join address (master mode)
+//   mode: "idle" | "master" | "relayhost" | "client",
+//   addr: "192.168.1.23:8927",           // LAN join address (master mode),
+//                                         // or the relay URL (relayhost mode)
 //   capture_label: "Broadcasting System Audio",
 //   master_plays: false,
 //   master_volume: 0.78,                  // 0..1
@@ -47,6 +50,7 @@
     return {
       mock: false,
       startMaster: () => invoke("start_master"),
+      startRelayHost: (relay) => invoke("start_relay_host", { relay }),
       stopMaster: () => invoke("stop_master"),
       startClient: (addr) => invoke("start_client", { addr }),
       stopClient: () => invoke("stop_client"),
@@ -103,6 +107,12 @@
       mock: true,
       startMaster: () => {
         state.mode = "master";
+        emit();
+        return Promise.resolve();
+      },
+      startRelayHost: (relay) => {
+        state.mode = "relayhost";
+        state.addr = relay ? "http://" + relay.replace(/^https?:\/\//, "") : "http://relay.example:8927";
         emit();
         return Promise.resolve();
       },
@@ -186,6 +196,8 @@
   const joinAddr = document.getElementById("joinAddr");
   const joinGo = document.getElementById("joinGo");
   const hostGo = document.getElementById("hostGo");
+  const hostRelayForm = document.getElementById("hostRelayForm");
+  const hostRelayAddr = document.getElementById("hostRelayAddr");
   const chooserError = document.getElementById("chooserError");
 
   // Dashboard
@@ -230,6 +242,7 @@
     cardHost.classList.add("selected");
     cardJoin.classList.remove("selected");
     joinForm.classList.remove("show");
+    hostRelayForm.classList.add("show");
     hostGo.style.display = "inline-block";
     chooserError.textContent = "";
   });
@@ -239,6 +252,7 @@
     cardJoin.classList.add("selected");
     cardHost.classList.remove("selected");
     joinForm.classList.add("show");
+    hostRelayForm.classList.remove("show");
     hostGo.style.display = "none";
     chooserError.textContent = "";
     joinAddr.focus();
@@ -246,7 +260,9 @@
 
   hostGo.addEventListener("click", () => {
     chooserError.textContent = "";
-    backend.startMaster().catch((e) => {
+    const relay = hostRelayAddr.value.trim();
+    const start = relay ? backend.startRelayHost(relay) : backend.startMaster();
+    start.catch((e) => {
       chooserError.textContent = "Could not start hosting: " + describeError(e);
     });
   });
@@ -684,7 +700,7 @@
   function applyState(rawState) {
     const state = normalizeState(rawState);
     if (!state) return;
-    if (state.mode === "master") {
+    if (state.mode === "master" || state.mode === "relayhost") {
       showScreen("dashboard");
       renderDashboard(state);
     } else if (state.mode === "client") {

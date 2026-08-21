@@ -10,6 +10,8 @@ pub enum Mode {
     Idle,
     Master,
     Client,
+    /// Hosting via a remote relay uplink instead of serving children directly.
+    RelayHost,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -90,6 +92,30 @@ impl From<&ClientEntry> for ClientView {
     }
 }
 
+/// Registry entry for a child tracked via a relay uplink (no local socket —
+/// the relay owns the actual connection). Populated from `child_joined` /
+/// `roster` messages on the `/source` uplink; see relay_uplink.rs.
+#[derive(Debug, Clone)]
+pub struct RelayChild {
+    pub id: u32,
+    pub name: String,
+    pub kind: ClientKind,
+    pub latency_ms: f64,
+    pub config: ClientConfig,
+}
+
+impl From<&RelayChild> for ClientView {
+    fn from(c: &RelayChild) -> Self {
+        ClientView {
+            id: c.id,
+            name: c.name.clone(),
+            kind: c.kind,
+            latency_ms: c.latency_ms,
+            config: c.config,
+        }
+    }
+}
+
 /// Live status of this app's own client pipeline (native client mode).
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct ClientStatus {
@@ -127,6 +153,18 @@ pub struct AppState {
     pub warnings: Vec<String>,
     pub client_addr: Option<String>,
     pub client_status: Option<ClientStatus>,
+    /// Children reported by a relay uplink (RelayHost mode), keyed by the
+    /// relay-assigned id. Kept separate from `clients` so direct-LAN mode is
+    /// untouched; merged into the view in `to_view()`.
+    pub relay_children: HashMap<u32, RelayChild>,
+    /// Public relay URL (e.g. "http://1.2.3.4:8927") to show as the join
+    /// address while in RelayHost mode.
+    pub relay_url: Option<String>,
+    /// Raw JSON-line sender to the relay's `/source` socket, set by
+    /// relay_uplink::run_uplink while connected. `set_client_config` /
+    /// `set_crossover` write into this instead of per-client senders when
+    /// `mode == RelayHost`.
+    pub uplink_ctrl: Option<mpsc::UnboundedSender<String>>,
 }
 
 impl Default for AppState {
@@ -143,6 +181,9 @@ impl Default for AppState {
             warnings: Vec::new(),
             client_addr: None,
             client_status: None,
+            relay_children: HashMap::new(),
+            relay_url: None,
+            uplink_ctrl: None,
         }
     }
 }
@@ -168,13 +209,14 @@ pub struct StateView {
 impl AppState {
     pub fn to_view(&self) -> StateView {
         let mut clients: Vec<ClientView> = self.clients.values().map(ClientView::from).collect();
+        clients.extend(self.relay_children.values().map(ClientView::from));
         clients.sort_by_key(|c| c.id);
-        let addr = if self.mode == Mode::Master {
-            local_ip_address::local_ip()
+        let addr = match self.mode {
+            Mode::Master => local_ip_address::local_ip()
                 .ok()
-                .map(|ip| format!("http://{ip}:8927"))
-        } else {
-            None
+                .map(|ip| format!("http://{ip}:8927")),
+            Mode::RelayHost => self.relay_url.clone(),
+            _ => None,
         };
         // Weak-network heuristic: any measured client RTT above 60 ms.
         let wifi_ok = clients
