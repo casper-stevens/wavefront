@@ -54,11 +54,23 @@
   let joinPerfMs = 0;   // performance.now() sampled at join
   let joinCtxTime = 0;  // audioContext.currentTime sampled at join
 
-  let currentOffset = 0;
+  let currentOffset = 0;   // latest offset estimate (ms) — filter's theta
   let currentRtt = 0;
   let minRtt = null;       // rolling minimum RTT baseline (ms)
-  let offsetInit = false;  // has the offset been seeded yet?
+  let offsetInit = false;  // has the filter been seeded yet?
   let pingTimer = null;
+
+  // 2-state Kalman filter for clock sync. State x = [theta, gamma]:
+  //   theta = clock offset (relay_clock - local performance clock), ms
+  //   gamma = drift rate of that offset, dimensionless (ms per ms)
+  // Modelling the drift (gamma) as a state lets the filter EXTRAPOLATE the
+  // offset smoothly between pings and discount asymmetric-jitter measurements,
+  // which linear smoothing can't. P is the 2x2 error covariance.
+  let kfTheta = 0;
+  let kfGamma = 0;
+  let kfP00 = 1e6, kfP01 = 0, kfP10 = 0, kfP11 = 1;
+  let kfLastMs = 0; // performance.now() of the last filter update
+  const KF_Q = 1e-9; // process-noise density (oscillator volatility), tunable
 
   let scheduledCount = 0;
   let droppedCount = 0;
@@ -210,37 +222,72 @@
 
   function handlePong(msg) {
     const tRecv = performance.now();
-    const t0 = msg.t0;
-    const t1 = msg.t1;
-    const rtt = tRecv - t0;
-    const offset = t1 + rtt / 2 - tRecv;
+    const rtt = tRecv - msg.t0;
+    const z = msg.t1 + rtt / 2 - tRecv; // measured offset (ms), NTP-style
 
-    // Rolling minimum-RTT baseline: snap down to any new low, leak up slowly so
-    // it adapts to changing network conditions instead of sticking forever to
-    // one lucky ping.
+    // Rolling minimum-RTT baseline (snap down, slow leak up) — used to gauge how
+    // much to trust each measurement.
     if (minRtt === null || rtt < minRtt) minRtt = rtt;
     else minRtt += Math.min(rtt - minRtt, 0.5);
 
-    // Only trust the offset from low-queue pings (RTT near the baseline) — a
-    // congested ping's offset is skewed. Fold accepted samples in with a gentle
-    // EMA so the offset is SMOOTH and continuously self-healing. The old
-    // min-over-a-sliding-window approach stepped whenever the best sample aged
-    // out, nudging each device differently — that's what drifted them apart and
-    // only a reload fixed. A smooth estimate holds them together and recovers
-    // on its own.
-    if (rtt <= minRtt + 8) {
-      if (!offsetInit) {
-        currentOffset = offset;
-        offsetInit = true;
-      } else {
-        currentOffset += (offset - currentOffset) * 0.15;
-      }
-    }
     currentRtt = currentRtt === 0 ? rtt : currentRtt + (rtt - currentRtt) * 0.2;
 
-    offsetVal.textContent = currentOffset.toFixed(1) + " ms";
+    if (!offsetInit) {
+      // Seed the filter from the first measurement.
+      kfTheta = z;
+      kfGamma = 0;
+      kfP00 = 100; kfP01 = 0; kfP10 = 0; kfP11 = 1e-4;
+      kfLastMs = tRecv;
+      offsetInit = true;
+      currentOffset = kfTheta;
+      offsetVal.textContent = kfTheta.toFixed(1) + " ms";
+      rttVal.textContent = currentRtt.toFixed(1) + " ms";
+      setStatus("synced", "synced");
+      return;
+    }
+
+    // --- Predict: advance state and covariance by tau ms since last update ---
+    const tau = Math.max(1, tRecv - kfLastMs);
+    kfLastMs = tRecv;
+    kfTheta = kfTheta + kfGamma * tau; // theta += gamma*tau; gamma unchanged
+    // P = F P F^T + Q, with F = [[1,tau],[0,1]]
+    const a00 = kfP00 + tau * kfP10, a01 = kfP01 + tau * kfP11;
+    const a10 = kfP10, a11 = kfP11;
+    let p00 = a00 + a01 * tau, p01 = a01;
+    let p10 = a10 + a11 * tau, p11 = a11;
+    // Q: continuous white-noise-acceleration on the drift term.
+    p00 += KF_Q * (tau * tau * tau) / 3;
+    p01 += KF_Q * (tau * tau) / 2;
+    p10 += KF_Q * (tau * tau) / 2;
+    p11 += KF_Q * tau;
+
+    // --- Update: fold in the measurement z (observes theta only) ---
+    // Measurement noise R grows with how congested this ping was vs the clean
+    // baseline: a low-jitter ping is trusted, a congested one is discounted.
+    const jitter = Math.max(0, rtt - minRtt);
+    const rStd = 1 + jitter / 2 + minRtt * 0.05;
+    const R = rStd * rStd;
+    const y = z - kfTheta; // innovation
+    const S = p00 + R;
+    const k0 = p00 / S;
+    const k1 = p10 / S;
+    kfTheta += k0 * y;
+    kfGamma += k1 * y;
+    kfP00 = (1 - k0) * p00;
+    kfP01 = (1 - k0) * p01;
+    kfP10 = p10 - k1 * p00;
+    kfP11 = p11 - k1 * p01;
+
+    currentOffset = kfTheta;
+    offsetVal.textContent = kfTheta.toFixed(1) + " ms";
     rttVal.textContent = currentRtt.toFixed(1) + " ms";
-    if (offsetInit) setStatus("synced", "synced");
+    setStatus("synced", "synced");
+  }
+
+  // Offset extrapolated to `nowMs` using the estimated drift — smooth and
+  // continuously drift-corrected between pings.
+  function offsetNow(nowMs) {
+    return offsetInit ? kfTheta + kfGamma * (nowMs - kfLastMs) : currentOffset;
   }
 
   // ---------------------------------------------------------------------
@@ -300,7 +347,7 @@
     const kInstant = now - nowMs / 1000;
     if (ctxPerfK === null) ctxPerfK = kInstant;
     else ctxPerfK += (kInstant - ctxPerfK) * 0.05;
-    const localPlayAtMs = playAt - currentOffset;
+    const localPlayAtMs = playAt - offsetNow(nowMs);
     // Output-latency compensation: a scheduled sample isn't HEARD until it
     // clears the browser graph (baseLatency) and the OS/DAC/Bluetooth chain
     // (outputLatency) — up to ~200ms on Bluetooth. Schedule that much EARLIER so
