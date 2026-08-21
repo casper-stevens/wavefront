@@ -239,6 +239,12 @@ async fn child_conn(socket: WebSocket, shared: SharedState) {
 
     {
         let mut children = shared.children.lock();
+        // Differentiate by default: alternate pan L / R as devices join so no
+        // two full-range speakers emit the identical waveform. A timing error
+        // between decorrelated signals is far less audible than between
+        // identical ones (comb filtering). Role stays "full" — sub/tweeter
+        // splitting is the operator's manual tool. `id` is 1-based.
+        let default_pan = if id % 2 == 1 { "left" } else { "right" };
         children.insert(
             id,
             Child {
@@ -247,7 +253,7 @@ async fn child_conn(socket: WebSocket, shared: SharedState) {
                 kind: kind.clone(),
                 latency_ms: 0.0,
                 role: "full".into(),
-                pan: "mid".into(),
+                pan: default_pan.into(),
                 gain: 0.8,
                 ctrl: ctrl_tx.clone(),
             },
