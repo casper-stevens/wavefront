@@ -617,7 +617,11 @@
     masterRoleToggle.checked = !!state.master_plays;
 
     const addr = state.addr || "";
-    joinUrlText.textContent = addr ? "http://" + addr : "http://—";
+    // The backend already includes the scheme (http:// or https://); only add
+    // one if it's somehow missing, so we never render "http://http://…".
+    joinUrlText.textContent = addr
+      ? (/^https?:\/\//.test(addr) ? addr : "http://" + addr)
+      : "http://—";
 
     wifiChip.classList.toggle("weak", state.wifi_ok === false);
     wifiLabel.textContent = state.wifi_ok === false ? "Wi‑Fi weak" : "Wi‑Fi strong";
