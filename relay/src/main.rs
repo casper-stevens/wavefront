@@ -26,7 +26,7 @@ use tokio::sync::{broadcast, mpsc};
 use tower_http::services::{ServeDir, ServeFile};
 
 const PORT: u16 = 8927;
-const DEFAULT_BUFFER_MS: u32 = 300;
+const DEFAULT_BUFFER_MS: u32 = 500;
 
 /// One connected child, as tracked by the relay.
 struct Child {
@@ -64,6 +64,13 @@ struct Shared {
     /// Text messages destined for the master's /source socket (child_joined,
     /// child_left, child_latency, roster). None when no master is connected.
     master_ctrl: Mutex<Option<mpsc::UnboundedSender<String>>>,
+    /// Monotonic token identifying the current source. A newer /source
+    /// connection takes over (higher gen); only audio and control from the
+    /// current generation are honored, and a stale source disconnecting can
+    /// neither clear a newer master's channel nor inject audio. Without this,
+    /// any second connection to /source could hijack or kill a live session.
+    source_gen: std::sync::atomic::AtomicU64,
+    active_source: Mutex<Option<u64>>,
     buffer_ms: Mutex<u32>,
     crossover_hz: Mutex<f32>,
 }
@@ -91,6 +98,8 @@ async fn main() -> anyhow::Result<()> {
     let shared: SharedState = Arc::new(Shared {
         start: Instant::now(),
         next_id: AtomicU32::new(1),
+        source_gen: std::sync::atomic::AtomicU64::new(0),
+        active_source: Mutex::new(None),
         children: Mutex::new(HashMap::new()),
         audio_tx,
         master_ctrl: Mutex::new(None),
@@ -302,6 +311,12 @@ async fn source_ws(ws: WebSocketUpgrade, State(shared): State<SharedState>) -> i
 async fn source_conn(socket: WebSocket, shared: SharedState) {
     let (mut sender, mut receiver) = socket.split();
 
+    // Claim source ownership. A newer connection wins; this generation gates
+    // both audio forwarding and the final channel teardown so a stale or
+    // rogue /source can't hijack or kill the live master.
+    let my_gen = shared.source_gen.fetch_add(1, Ordering::SeqCst) + 1;
+    *shared.active_source.lock() = Some(my_gen);
+
     // Register this master's control channel so the relay can push roster etc.
     let (m_tx, mut m_rx) = mpsc::unbounded_channel::<String>();
     *shared.master_ctrl.lock() = Some(m_tx);
@@ -329,6 +344,10 @@ async fn source_conn(socket: WebSocket, shared: SharedState) {
     });
 
     while let Some(Ok(msg)) = receiver.next().await {
+        // If a newer source took over, this one is stale — stop immediately.
+        if *shared.active_source.lock() != Some(my_gen) {
+            break;
+        }
         match msg {
             Message::Binary(bin) => {
                 // Strip the 12-byte header; the relay re-stamps per child.
@@ -344,7 +363,13 @@ async fn source_conn(socket: WebSocket, shared: SharedState) {
     }
 
     out.abort();
-    *shared.master_ctrl.lock() = None;
+    // Only tear down the shared channel if we're still the current owner; a
+    // stale source that lost the race must not clear a newer master.
+    let mut active = shared.active_source.lock();
+    if *active == Some(my_gen) {
+        *active = None;
+        *shared.master_ctrl.lock() = None;
+    }
 }
 
 fn handle_source_text(t: &str, shared: &SharedState) {
