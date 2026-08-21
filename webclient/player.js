@@ -8,8 +8,8 @@
  */
 
 (function () {
-  const SAMPLE_RATE = 48000;
-  const FRAMES_PER_CHUNK = 960;
+  const SAMPLE_RATE = 24000; // wire stream rate (half-rate to save bandwidth)
+  const FRAMES_PER_CHUNK = 480; // 20ms at 24kHz
   const HEADER_BYTES = 12;
   const PAYLOAD_BYTES = FRAMES_PER_CHUNK * 2 * 2; // stereo s16le
   const FRAME_BYTES = HEADER_BYTES + PAYLOAD_BYTES;
@@ -469,7 +469,11 @@
     joined = true;
     joinBtn.disabled = true;
 
-    audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: SAMPLE_RATE });
+    // Do NOT force the context to the 24kHz stream rate — some platforms
+    // (older iOS/WebKit) reject a non-hardware AudioContext rate. Run the
+    // context at the hardware rate and let Web Audio resample our 24kHz
+    // AudioBuffers on playback (createBuffer takes their own sample rate).
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
     if (audioCtx.state === "suspended") {
       try { await audioCtx.resume(); } catch (e) { /* ignore */ }
     }

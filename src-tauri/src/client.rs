@@ -235,16 +235,43 @@ fn handle_text(txt: &str, shared: &Arc<ClientShared>, report: &Option<SharedStat
     }
 }
 
+/// 2x upsample interleaved stereo s16 (24kHz -> 48kHz) via linear interpolation.
+fn upsample_2x_stereo(pcm: &[i16]) -> Vec<i16> {
+    let frames = pcm.len() / 2;
+    if frames == 0 {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(pcm.len() * 2);
+    for f in 0..frames {
+        let l0 = pcm[f * 2] as i32;
+        let r0 = pcm[f * 2 + 1] as i32;
+        let (l1, r1) = if f + 1 < frames {
+            (pcm[(f + 1) * 2] as i32, pcm[(f + 1) * 2 + 1] as i32)
+        } else {
+            (l0, r0)
+        };
+        out.push(l0 as i16);
+        out.push(r0 as i16);
+        out.push(((l0 + l1) / 2) as i16);
+        out.push(((r0 + r1) / 2) as i16);
+    }
+    out
+}
+
 fn handle_binary(bin: &[u8], shared: &Arc<ClientShared>, _start: &Instant) {
     if bin.len() < 12 || bin[0] != 0x01 {
         return;
     }
     let play_at = f64::from_le_bytes(bin[4..12].try_into().unwrap());
     let pcm_bytes = &bin[12..];
-    let pcm: Vec<i16> = pcm_bytes
+    let pcm_24k: Vec<i16> = pcm_bytes
         .chunks_exact(2)
         .map(|c| i16::from_le_bytes([c[0], c[1]]))
         .collect();
+    // The wire stream is 24kHz stereo (half-rate to save bandwidth); the output
+    // stream and DSP run at 48kHz, so upsample 2x here. 2x linear interpolation
+    // is plenty for the low-fidelity playback this targets.
+    let pcm = upsample_2x_stereo(&pcm_24k);
 
     let offset = *shared.offset_ms.lock();
     let local_play_at = play_at - offset;

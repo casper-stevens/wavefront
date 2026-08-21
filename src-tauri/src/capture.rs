@@ -8,8 +8,8 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::broadcast;
 
-pub const TARGET_SAMPLE_RATE: u32 = 48_000;
-pub const CHUNK_FRAMES: usize = 960; // 20ms at 48kHz
+pub const TARGET_SAMPLE_RATE: u32 = 24_000;
+pub const CHUNK_FRAMES: usize = 480; // 20ms at 24kHz
 
 #[derive(Debug, Clone)]
 pub struct AudioChunk {

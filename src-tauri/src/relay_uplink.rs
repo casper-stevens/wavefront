@@ -66,7 +66,46 @@ pub async fn run_uplink(
 ) -> anyhow::Result<()> {
     let (_public_url, ws_url) = normalize_relay_addr(&relay_url);
 
-    let (ws_stream, _) = tokio_tungstenite::connect_async(&ws_url).await?;
+    // Auto-reconnect loop: if the master->relay link drops (Wi-Fi blip, relay
+    // restart), re-establish it automatically instead of ending the whole host
+    // session. `capture` stays alive across attempts and is re-subscribed each
+    // time. We do NOT replay missed audio — live playback resyncs to "now" on
+    // both ends — we just minimise the outage.
+    while !stop.load(Ordering::SeqCst) {
+        match connect_and_run(&ws_url, &state, &capture, &stop).await {
+            Ok(()) => {}
+            Err(e) => eprintln!("wavefront: uplink dropped ({e}); reconnecting…"),
+        }
+        // Reflect the outage in the UI (roster empties until we're back).
+        {
+            let mut st = state.lock();
+            st.uplink_ctrl = None;
+            st.relay_children.clear();
+        }
+        if stop.load(Ordering::SeqCst) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+    }
+
+    {
+        let mut st = state.lock();
+        st.uplink_ctrl = None;
+        st.relay_children.clear();
+    }
+    // `capture` (owned by this function) is dropped here, stopping the capture
+    // thread via CaptureHandle's Drop impl.
+    Ok(())
+}
+
+/// One connect-and-serve attempt; returns when the link drops or `stop` is set.
+async fn connect_and_run(
+    ws_url: &str,
+    state: &SharedState,
+    capture: &CaptureHandle,
+    stop: &Arc<AtomicBool>,
+) -> anyhow::Result<()> {
+    let (ws_stream, _) = tokio_tungstenite::connect_async(ws_url).await?;
     let (mut write, mut read) = ws_stream.split();
 
     let (buffer_ms, crossover_hz) = {
@@ -124,14 +163,9 @@ pub async fn run_uplink(
         }
     }
 
-    {
-        let mut st = state.lock();
-        st.uplink_ctrl = None;
-        st.relay_children.clear();
-    }
-    stop.store(true, Ordering::SeqCst);
-    // `capture` (owned by this function) is dropped here, which stops the
-    // underlying capture thread via CaptureHandle's Drop impl.
+    // This attempt ended (drop or stop). Clear the ctrl channel; the outer loop
+    // decides whether to reconnect (based on `stop`) and handles roster cleanup.
+    state.lock().uplink_ctrl = None;
     Ok(())
 }
 
