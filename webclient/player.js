@@ -273,10 +273,15 @@
     const localPlayAtMs = playAt - currentOffset;
     const targetCtx = localPlayAtMs / 1000 + ctxPerfK;
 
+    // Correct drift by nudging PLAYBACK RATE, not chunk start times. Buffers
+    // stay perfectly contiguous (gapless — no seams on any platform), while a
+    // sub-percent rate change smoothly steers the cursor onto the shared clock.
+    // Only a genuine underrun or large loss-of-lock triggers a hard re-anchor.
+    let rate = 1;
     if (
       playHead === 0 ||
       playHead < now + 0.005 ||               // underrun / first chunk
-      Math.abs(playHead - targetCtx) > 0.15    // lost lock: hard re-anchor
+      Math.abs(playHead - targetCtx) > 0.2     // lost lock: hard re-anchor
     ) {
       if (playHead !== 0 && playHead < now + 0.005) {
         droppedCount++;
@@ -284,17 +289,19 @@
       }
       playHead = Math.max(targetCtx, now + 0.005);
     } else {
-      // In lock: gently pull the cursor toward the shared target. Sub-millisecond
-      // per-chunk nudges (5% of the error every 20ms) are inaudible but null out
-      // slow inter-device drift within ~1s.
-      playHead += (targetCtx - playHead) * 0.05;
+      // error > 0 → cursor ahead of target (buffer too deep) → play a hair
+      // faster to drain; error < 0 → play a hair slower. Clamp to ±0.3%
+      // (~5 cents, inaudible). Drives inter-device error to zero smoothly.
+      const error = playHead - targetCtx;
+      rate = Math.max(0.997, Math.min(1.003, 1 + 0.5 * error));
     }
 
     const startAt = playHead;
-    playHead += CHUNK_DUR;
+    playHead += CHUNK_DUR / rate; // buffer occupies CHUNK_DUR/rate of real time
 
     const source = audioCtx.createBufferSource();
     source.buffer = audioBuffer;
+    if (rate !== 1) source.playbackRate.value = rate;
     connectSourceForRole(source, currentConfig.role);
 
     scheduledCount++;
