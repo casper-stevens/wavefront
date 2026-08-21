@@ -202,7 +202,9 @@
 
   function sendPing() {
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
-    ws.send(JSON.stringify({ type: "ping", t0: performance.now() }));
+    // Report our own measured RTT so the relay/master can show real per-device
+    // latency and an accurate synced count.
+    ws.send(JSON.stringify({ type: "ping", t0: performance.now(), rtt: Math.round(currentRtt) }));
   }
 
   function handlePong(msg) {

@@ -321,6 +321,13 @@ async fn child_conn(socket: WebSocket, shared: SharedState) {
                     let t0 = v.get("t0").and_then(|x| x.as_f64()).unwrap_or(0.0);
                     let t1 = shared.now_ms();
                     let _ = ctrl_tx.send(json!({"type":"pong","t0":t0,"t1":t1}).to_string());
+                    // The child reports its own measured RTT; store it so the
+                    // roster carries real per-device latency to the master.
+                    if let Some(rtt) = v.get("rtt").and_then(|x| x.as_f64()) {
+                        if let Some(c) = shared.children.lock().get_mut(&id) {
+                            c.latency_ms = rtt;
+                        }
+                    }
                 }
             }
             Message::Close(_) => break,

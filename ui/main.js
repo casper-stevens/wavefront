@@ -688,7 +688,9 @@
       name: c.name,
       kind: c.kind === "native" ? "app" : c.kind,
       latency_ms: c.latency_ms || 0,
-      synced: c.synced !== undefined ? c.synced : (c.latency_ms || 0) > 0 && c.latency_ms < 60,
+      // Synced once the device has reported a latency and it's within a
+      // generous bound for the relay/internet path. (0 = not measured yet.)
+      synced: c.synced !== undefined ? c.synced : (c.latency_ms || 0) > 0 && c.latency_ms < 300,
       role: c.role !== undefined ? c.role : c.config ? c.config.role : "full",
       pan: c.pan !== undefined ? c.pan : c.config ? c.config.pan : "mid",
       gain: c.gain !== undefined ? c.gain : c.config ? c.config.gain : 0.8,
