@@ -174,7 +174,7 @@ impl Default for AppState {
             clients: HashMap::new(),
             next_client_id: 1,
             crossover_hz: 220.0,
-            buffer_ms: 500,
+            buffer_ms: 1000,
             master_volume: 1.0,
             master_plays: true,
             capture_source: String::new(),

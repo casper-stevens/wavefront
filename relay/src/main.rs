@@ -26,7 +26,7 @@ use tokio::sync::{broadcast, mpsc};
 use tower_http::services::{ServeDir, ServeFile};
 
 const PORT: u16 = 8927;
-const DEFAULT_BUFFER_MS: u32 = 500;
+const DEFAULT_BUFFER_MS: u32 = 1000;
 
 /// One connected child, as tracked by the relay.
 struct Child {
