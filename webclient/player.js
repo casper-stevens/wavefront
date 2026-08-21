@@ -35,6 +35,7 @@
   const scheduledVal = document.getElementById("scheduledVal");
   const droppedVal = document.getElementById("droppedVal");
   const glitchVal = document.getElementById("glitchVal");
+  const outLatVal = document.getElementById("outLatVal");
   const muteBtn = document.getElementById("muteBtn");
   const hiddenWarning = document.getElementById("hiddenWarning");
   const hostLabel = document.getElementById("hostLabel");
@@ -300,7 +301,17 @@
     if (ctxPerfK === null) ctxPerfK = kInstant;
     else ctxPerfK += (kInstant - ctxPerfK) * 0.05;
     const localPlayAtMs = playAt - currentOffset;
-    const targetCtx = localPlayAtMs / 1000 + ctxPerfK;
+    // Output-latency compensation: a scheduled sample isn't HEARD until it
+    // clears the browser graph (baseLatency) and the OS/DAC/Bluetooth chain
+    // (outputLatency) — up to ~200ms on Bluetooth. Schedule that much EARLIER so
+    // every device's ACOUSTIC output lands on the shared target, not just its
+    // logical schedule. Clamp so a bogus huge value can't push us past the buffer.
+    const outDelay = Math.min(
+      0.5,
+      (audioCtx.baseLatency || 0) + (audioCtx.outputLatency || 0)
+    );
+    if (outLatVal) outLatVal.textContent = Math.round(outDelay * 1000) + " ms";
+    const targetCtx = localPlayAtMs / 1000 + ctxPerfK - outDelay;
 
     // Correct drift by nudging PLAYBACK RATE, not chunk start times. Buffers
     // stay perfectly contiguous (gapless — no seams on any platform), while a
