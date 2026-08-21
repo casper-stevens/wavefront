@@ -103,6 +103,7 @@
   let syncReliable = true;
   let reliableSinceCtx = 0;   // audioCtx time healthy conditions began
   let unreliableUntilCtx = 0; // hold muted at least until this ctx time
+  let masterSuspect = false;  // the group flagged us as a sync outlier
 
   function updateOutputGain() {
     if (!muteGain || !audioCtx) return;
@@ -119,7 +120,7 @@
     const jitter = currentRtt - (minRtt || 0);
     const confident =
       offsetInit && Math.sqrt(kfP00) < 10 && jitter < 100;
-    const healthy = confident && nowCtx >= unreliableUntilCtx;
+    const healthy = confident && !masterSuspect && nowCtx >= unreliableUntilCtx;
     if (healthy) {
       if (reliableSinceCtx === 0) reliableSinceCtx = nowCtx;
       if (!syncReliable && nowCtx - reliableSinceCtx > 0.3) {
@@ -411,9 +412,16 @@ registerProcessor('wavefront-player', WavefrontPlayer);
 
   function sendPing() {
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
-    // Report our own measured RTT so the relay/master can show real per-device
-    // latency and an accurate synced count.
-    ws.send(JSON.stringify({ type: "ping", t0: performance.now(), rtt: Math.round(currentRtt) }));
+    // Report RTT and jitter (RTT above the clean baseline). Jitter is the real
+    // sync-quality signal: the relay/master use it to spot a device the GROUP
+    // considers an outlier (worse than its peers), which self-assessment can't.
+    const jitter = Math.max(0, Math.round(currentRtt - (minRtt || currentRtt)));
+    ws.send(JSON.stringify({
+      type: "ping",
+      t0: performance.now(),
+      rtt: Math.round(currentRtt),
+      jitter: jitter,
+    }));
   }
 
   function handlePong(msg) {
@@ -679,6 +687,12 @@ registerProcessor('wavefront-player', WavefrontPlayer);
           currentConfig = Object.assign({}, currentConfig, msg);
           applyConfigToGraph(currentConfig);
           renderConfig();
+          // The group flagged us as a sync outlier -> stay silent even if our
+          // own self-assessment thinks we're fine (the case self-mute misses).
+          masterSuspect = !!msg.suspect;
+          if (masterSuspect) {
+            markUnreliable(1.0);
+          }
           break;
         case "pong":
           handlePong(msg);

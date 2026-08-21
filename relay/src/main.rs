@@ -34,8 +34,10 @@ struct Child {
     name: String,
     kind: String, // "native" | "browser"
     latency_ms: f64,
-    role: String, // "sub" | "tweeter" | "full"
-    pan: String,  // "left" | "mid" | "right"
+    jitter_ms: f64, // RTT above the child's clean baseline (sync-quality signal)
+    suspect: bool,  // the GROUP considers this device a sync outlier
+    role: String,   // "sub" | "tweeter" | "full"
+    pan: String,    // "left" | "mid" | "right"
     gain: f32,
     /// Text control messages (config/pong) destined for this child.
     ctrl: mpsc::UnboundedSender<String>,
@@ -50,6 +52,7 @@ impl Child {
             "gain": self.gain,
             "crossover_hz": crossover_hz,
             "buffer_ms": buffer_ms,
+            "suspect": self.suspect,
         })
     }
 }
@@ -106,6 +109,49 @@ impl Shared {
     /// candidate — the fastest delivery is the truest baseline — but only leak
     /// upward slowly, so occasional late arrivals (and reconnect bursts, which
     /// all look late) don't inflate the baseline and push live audio early.
+    /// Flag devices the GROUP considers sync outliers: much jitterier than the
+    /// peer median (jitter, not raw latency, is what predicts poor lock). A
+    /// flagged child receives suspect=true in its config and force-mutes, so one
+    /// device on a bad path can't echo-ruin the room even if it *thinks* it's
+    /// fine. Pushes an updated config to any child whose flag changed.
+    fn recompute_suspects(&self) {
+        let (xover, buf) = (*self.crossover_hz.lock(), *self.buffer_ms.lock());
+        let mut children = self.children.lock();
+        let mut jitters: Vec<f64> = children
+            .values()
+            .filter(|c| c.latency_ms > 0.0)
+            .map(|c| c.jitter_ms)
+            .collect();
+        let mut changed: Vec<u32> = Vec::new();
+        if jitters.len() < 3 {
+            // Too few peers to judge an outlier — clear any flags.
+            for c in children.values_mut() {
+                if c.suspect {
+                    c.suspect = false;
+                    changed.push(c.id);
+                }
+            }
+        } else {
+            jitters.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let median = jitters[jitters.len() / 2];
+            for c in children.values_mut() {
+                if c.latency_ms <= 0.0 {
+                    continue;
+                }
+                let sus = c.jitter_ms > (median * 3.0).max(median + 25.0) && c.jitter_ms > 30.0;
+                if sus != c.suspect {
+                    c.suspect = sus;
+                    changed.push(c.id);
+                }
+            }
+        }
+        for id in changed {
+            if let Some(c) = children.get(&id) {
+                let _ = c.ctrl.send(c.config_json(xover, buf).to_string());
+            }
+        }
+    }
+
     fn update_master_offset(&self, candidate: f64) -> f64 {
         const LEAK_PER_CHUNK_MS: f64 = 0.05; // ~2.5ms/s: tracks real clock drift
         let mut o = self.master_offset.lock();
@@ -147,6 +193,7 @@ async fn main() -> anyhow::Result<()> {
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
             loop {
                 tick.tick().await;
+                shared.recompute_suspects();
                 let children: Vec<serde_json::Value> = shared
                     .children
                     .lock()
@@ -154,7 +201,8 @@ async fn main() -> anyhow::Result<()> {
                     .map(|c| {
                         json!({
                             "id": c.id, "name": c.name, "kind": c.kind,
-                            "latency_ms": c.latency_ms, "role": c.role,
+                            "latency_ms": c.latency_ms, "jitter_ms": c.jitter_ms,
+                            "suspect": c.suspect, "role": c.role,
                             "pan": c.pan, "gain": c.gain,
                         })
                     })
@@ -252,6 +300,8 @@ async fn child_conn(socket: WebSocket, shared: SharedState) {
                 name: name.clone(),
                 kind: kind.clone(),
                 latency_ms: 0.0,
+                jitter_ms: 0.0,
+                suspect: false,
                 role: "full".into(),
                 pan: default_pan.into(),
                 gain: 0.8,
@@ -332,6 +382,9 @@ async fn child_conn(socket: WebSocket, shared: SharedState) {
                     if let Some(rtt) = v.get("rtt").and_then(|x| x.as_f64()) {
                         if let Some(c) = shared.children.lock().get_mut(&id) {
                             c.latency_ms = rtt;
+                            if let Some(j) = v.get("jitter").and_then(|x| x.as_f64()) {
+                                c.jitter_ms = j;
+                            }
                         }
                     }
                 }
@@ -375,6 +428,7 @@ async fn source_conn(socket: WebSocket, shared: SharedState) {
             .values()
             .map(|c| {
                 json!({"id":c.id,"name":c.name,"kind":c.kind,"latency_ms":c.latency_ms,
+                       "jitter_ms":c.jitter_ms,"suspect":c.suspect,
                        "role":c.role,"pan":c.pan,"gain":c.gain})
             })
             .collect();

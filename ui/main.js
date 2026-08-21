@@ -544,12 +544,15 @@
 
       const roleClass = roleClassFor[c.role] || "full";
       const kindLabel = c.kind === "browser" ? "browser" : "app";
+      const subtitle = c.suspect
+        ? "out of sync — muted"
+        : roleLabelFor[c.role] + " · " + Math.round(c.latency_ms) + " ms";
 
       row.innerHTML =
         '<div class="dr-top">' +
         '<div class="role-icon ' + roleClass + '">' + (roleIconSvg[c.role] || roleIconSvg.full) + "</div>" +
         '<div class="dr-name"><div class="n1">' + escapeHtml(c.name) + '</div>' +
-        '<div class="n2">' + roleLabelFor[c.role] + " · " + Math.round(c.latency_ms) + " ms</div></div>" +
+        '<div class="n2">' + subtitle + "</div></div>" +
         '<span class="kind-badge">' + kindLabel + "</span>" +
         '<span class="status-dot' + (c.synced ? "" : " warn") + '"></span>' +
         "</div>" +
@@ -688,9 +691,12 @@
       name: c.name,
       kind: c.kind === "native" ? "app" : c.kind,
       latency_ms: c.latency_ms || 0,
+      // A device the group flagged as a jitter outlier: it's auto-muted and
+      // shown as out-of-sync so you know it removed itself from the mix.
+      suspect: !!c.suspect,
       // Synced once the device has reported a latency and it's within a
-      // generous bound for the relay/internet path. (0 = not measured yet.)
-      synced: c.synced !== undefined ? c.synced : (c.latency_ms || 0) > 0 && c.latency_ms < 300,
+      // generous bound for the relay/internet path — and not a group outlier.
+      synced: c.synced !== undefined ? c.synced : (c.latency_ms || 0) > 0 && c.latency_ms < 300 && !c.suspect,
       role: c.role !== undefined ? c.role : c.config ? c.config.role : "full",
       pan: c.pan !== undefined ? c.pan : c.config ? c.config.pan : "mid",
       gain: c.gain !== undefined ? c.gain : c.config ? c.config.gain : 0.8,
