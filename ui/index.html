@@ -1,0 +1,207 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Wavefront</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<div class="window">
+
+  <div class="titlebar">
+    <div class="traffic-lights"><span class="tl red"></span><span class="tl yellow"></span><span class="tl green"></span></div>
+    <div class="titlebar-title">Wavefront</div>
+  </div>
+
+  <!-- ============ SCREEN: mode chooser ============ -->
+  <section class="screen active" id="screen-chooser">
+    <div class="chooser">
+      <div class="chooser-brand">
+        <div class="chooser-logo">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M3 10v4M7 6v12M11 3v18M15 6v12M19 10v4"/></svg>
+        </div>
+        <h1>Wavefront</h1>
+        <p>Turn every laptop on your network into a synced speaker. Host a session from this Mac, or join one already running nearby.</p>
+      </div>
+
+      <div class="chooser-cards">
+        <button class="chooser-card" id="cardHost" type="button">
+          <div class="chooser-card-icon">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M2 20h20"/></svg>
+          </div>
+          <h3>Host a session</h3>
+          <p>Broadcast audio from this Mac to any number of speakers on your network.</p>
+        </button>
+        <button class="chooser-card" id="cardJoin" type="button">
+          <div class="chooser-card-icon">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 9v6h3l5 4V5L7 9H4Z"/><path d="M16 9a4 4 0 0 1 0 6"/></svg>
+          </div>
+          <h3>Join a session</h3>
+          <p>Turn this Mac into a speaker for a session hosted somewhere else.</p>
+        </button>
+      </div>
+
+      <div class="join-form" id="joinForm">
+        <input type="text" id="joinAddr" placeholder="Master IP or address, e.g. 192.168.1.23:8927">
+        <button class="btn btn-primary" id="joinGo" type="button">Join</button>
+      </div>
+
+      <div style="display:flex; align-items:center; gap:10px;">
+        <button class="btn btn-primary" id="hostGo" type="button" style="display:none;">Start hosting</button>
+      </div>
+
+      <div class="chooser-error" id="chooserError"></div>
+    </div>
+  </section>
+
+  <!-- ============ SCREEN: master dashboard ============ -->
+  <section class="screen" id="screen-dashboard">
+    <div class="toolbar">
+      <div class="source-status">
+        <div class="source-icon">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M3 10v4M7 6v12M11 3v18M15 6v12M19 10v4"/></svg>
+        </div>
+        <div class="source-text">
+          <span class="t1" id="captureLabel">Broadcasting System Audio</span>
+          <span class="t2">Whatever is playing on this Mac</span>
+        </div>
+      </div>
+
+      <div class="toolbar-divider"></div>
+
+      <div class="toolbar-control">
+        <span class="tc-label">MASTER VOLUME</span>
+        <div class="vol-row">
+          <input type="range" min="0" max="100" value="78" id="masterVolume">
+        </div>
+      </div>
+
+      <div class="toolbar-divider"></div>
+
+      <div class="switch-row">
+        <label class="switch">
+          <input type="checkbox" id="masterRoleToggle">
+          <span class="track"><span class="thumb"></span></span>
+        </label>
+        <div>
+          <div class="sr-label">Play through this Mac</div>
+          <div class="sr-sub">Give the master a role in the room</div>
+        </div>
+      </div>
+
+      <div class="spacer"></div>
+
+      <button class="join-url-chip" id="joinUrlChip" type="button" title="Click to copy">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.07 0l1.93-1.93a5 5 0 0 0-7.07-7.07L10.5 5.5"/><path d="M14 11a5 5 0 0 0-7.07 0l-1.93 1.93a5 5 0 0 0 7.07 7.07L13.5 18.5"/></svg>
+        <span class="mono" id="joinUrlText">http://—</span>
+      </button>
+
+      <button class="wifi-chip" id="wifiChip" type="button">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 8.5a16 16 0 0 1 20 0M5.5 12a11 11 0 0 1 13 0M9 15.5a6 6 0 0 1 6 0"/><circle cx="12" cy="19" r="1" fill="currentColor" stroke="none"/></svg>
+        <span id="wifiLabel">Wi‑Fi strong</span>
+      </button>
+
+      <button class="btn btn-danger" id="stopMasterBtn" type="button">Stop</button>
+    </div>
+
+    <div class="banner" id="warnBanner">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M10.3 3.86 1.8 18a1 1 0 0 0 .86 1.5h18.7a1 1 0 0 0 .86-1.5L13.7 3.86a1 1 0 0 0-1.7 0Z"/><path d="M12 9v4M12 16.5h.01"/></svg>
+      <span id="warnText"></span>
+    </div>
+
+    <div class="content">
+      <aside class="sidebar">
+        <div class="sidebar-head">
+          <span>Speakers</span>
+          <span class="mono" id="onlineCount">0 online</span>
+        </div>
+        <div class="sidebar-list" id="deviceList"></div>
+      </aside>
+
+      <main class="main">
+        <div class="panel">
+          <div class="panel-head">
+            <h2>Room Layout</h2>
+            <span class="hint">drag to reposition</span>
+          </div>
+          <div class="room" id="room">
+            <div class="listener"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 13a8 8 0 0 1 16 0"/><path d="M4 13v4a2 2 0 0 0 2 2h1v-6H5a1 1 0 0 0-1 1Z"/><path d="M20 13v4a2 2 0 0 1-2 2h-1v-6h1a1 1 0 0 1 1 1Z"/></svg></div>
+            <!-- pucks injected here -->
+          </div>
+          <div class="room-legend">
+            <span><i class="swatch" style="background: var(--low)"></i>Sub — lows only</span>
+            <span><i class="swatch" style="background: var(--high)"></i>Tweeter — highs only</span>
+            <span><i class="swatch" style="background: var(--full)"></i>Full‑range</span>
+            <span><i class="swatch" style="background: var(--accent)"></i>Master</span>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-head">
+            <h2>Crossover</h2>
+            <span class="hint">low / high split point</span>
+          </div>
+          <div class="xover-body">
+            <div class="xover-canvas-wrap">
+              <canvas id="xoverCanvas" width="300" height="72" style="width:100%; height:72px; display:block;"></canvas>
+              <input type="range" min="60" max="500" value="220" id="xoverSlider" style="margin-top:8px;">
+            </div>
+            <div class="xfreq-readout">
+              <div class="big mono" id="xoverReadout">220</div>
+              <div class="unit">Hz</div>
+            </div>
+          </div>
+        </div>
+      </main>
+    </div>
+
+    <footer class="status">
+      <div class="fs-left">
+        <span class="dot" id="syncDot"></span>
+        <span id="syncSummary">0 of 0 speakers synced</span>
+      </div>
+      <span class="mono" id="netSummary"></span>
+    </footer>
+  </section>
+
+  <!-- ============ SCREEN: client (joined) ============ -->
+  <section class="screen" id="screen-client">
+    <div class="client-screen">
+      <div class="client-state-icon" id="clientStateIcon">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 9v6h3l5 4V5L7 9H4Z"/><path d="M16 9a4 4 0 0 1 0 6"/></svg>
+      </div>
+      <div>
+        <h2 class="client-title" id="clientTitle">Connecting…</h2>
+        <p class="client-sub" id="clientSub">Reaching the master session.</p>
+      </div>
+
+      <div class="client-grid">
+        <div class="client-stat">
+          <div class="cs-label">Role</div>
+          <div class="cs-value" id="clientRole">—</div>
+        </div>
+        <div class="client-stat">
+          <div class="cs-label">Pan</div>
+          <div class="cs-value" id="clientPan">—</div>
+        </div>
+        <div class="client-stat">
+          <div class="cs-label">Gain</div>
+          <div class="cs-value" id="clientGain">—</div>
+        </div>
+        <div class="client-stat">
+          <div class="cs-label">Latency</div>
+          <div class="cs-value" id="clientLatency">—</div>
+        </div>
+      </div>
+
+      <button class="btn btn-danger" id="stopClientBtn" type="button">Disconnect</button>
+    </div>
+  </section>
+
+</div>
+
+<script src="main.js"></script>
+</body>
+</html>
