@@ -54,13 +54,28 @@ impl Child {
     }
 }
 
+/// One audio chunk fanned out to children: the PCM payload plus the play time
+/// already computed (in relay clock) by the source handler. Computing it once —
+/// from the master's timeline — means every child shares the exact same
+/// deadline (tighter sync) and chunks burst on reconnect keep their original
+/// deadline instead of being re-stamped to "now".
+#[derive(Clone)]
+struct AudioMsg {
+    play_at: f64,
+    pcm: Arc<Vec<u8>>,
+}
+
 struct Shared {
     start: Instant,
     next_id: AtomicU32,
     children: Mutex<HashMap<u32, Child>>,
-    /// Broadcast of raw s16le stereo PCM chunks (payload only, no header) from
-    /// the current source to all child audio-forwarding tasks.
-    audio_tx: broadcast::Sender<Arc<Vec<u8>>>,
+    /// Broadcast of (play_at, PCM) chunks from the current source to all child
+    /// forwarding tasks.
+    audio_tx: broadcast::Sender<AudioMsg>,
+    /// Stable master-clock -> relay-clock offset (ms), min-tracked with slow
+    /// upward leak. Held across reconnects so a burst of buffered chunks maps to
+    /// its correct earlier play time rather than being pushed to "now".
+    master_offset: Mutex<Option<f64>>,
     /// Text messages destined for the master's /source socket (child_joined,
     /// child_left, child_latency, roster). None when no master is connected.
     master_ctrl: Mutex<Option<mpsc::UnboundedSender<String>>>,
@@ -85,6 +100,23 @@ impl Shared {
             let _ = tx.send(msg.to_string());
         }
     }
+
+    /// Update and return the master->relay clock offset given a fresh candidate
+    /// (relay_now - master_ts). Min-tracking: snap down to any tighter (lower)
+    /// candidate — the fastest delivery is the truest baseline — but only leak
+    /// upward slowly, so occasional late arrivals (and reconnect bursts, which
+    /// all look late) don't inflate the baseline and push live audio early.
+    fn update_master_offset(&self, candidate: f64) -> f64 {
+        const LEAK_PER_CHUNK_MS: f64 = 0.05; // ~2.5ms/s: tracks real clock drift
+        let mut o = self.master_offset.lock();
+        let next = match *o {
+            None => candidate,
+            Some(cur) if candidate < cur => candidate,
+            Some(cur) => cur + (candidate - cur).min(LEAK_PER_CHUNK_MS),
+        };
+        *o = Some(next);
+        next
+    }
 }
 
 type SharedState = Arc<Shared>;
@@ -94,7 +126,7 @@ async fn main() -> anyhow::Result<()> {
     let webclient_dir = resolve_webclient_dir();
     eprintln!("wavefront-relay: serving webclient from {webclient_dir:?}");
 
-    let (audio_tx, _) = broadcast::channel::<Arc<Vec<u8>>>(256);
+    let (audio_tx, _) = broadcast::channel::<AudioMsg>(256);
     let shared: SharedState = Arc::new(Shared {
         start: Instant::now(),
         next_id: AtomicU32::new(1),
@@ -102,6 +134,7 @@ async fn main() -> anyhow::Result<()> {
         active_source: Mutex::new(None),
         children: Mutex::new(HashMap::new()),
         audio_tx,
+        master_offset: Mutex::new(None),
         master_ctrl: Mutex::new(None),
         buffer_ms: Mutex::new(DEFAULT_BUFFER_MS),
         crossover_hz: Mutex::new(220.0),
@@ -233,8 +266,8 @@ async fn child_conn(socket: WebSocket, shared: SharedState) {
         let _ = ctrl_tx.send(c.config_json(crossover_hz, buffer_ms).to_string());
     }
 
-    // Outbound task: audio (re-stamped) + control, multiplexed to this socket.
-    let shared_out = shared.clone();
+    // Outbound task: audio + control, multiplexed to this socket. play_at is
+    // already computed by the source handler, so no shared state is needed here.
     let out = tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -249,15 +282,15 @@ async fn child_conn(socket: WebSocket, shared: SharedState) {
                 }
                 audio = audio_rx.recv() => {
                     match audio {
-                        Ok(pcm) => {
-                            let buffer_ms = *shared_out.buffer_ms.lock();
-                            let play_at = shared_out.now_ms() + buffer_ms as f64;
-                            let mut frame = Vec::with_capacity(12 + pcm.len());
+                        Ok(msg) => {
+                            // play_at was computed once by the source handler (relay
+                            // clock, from the master timeline) — same for every child.
+                            let mut frame = Vec::with_capacity(12 + msg.pcm.len());
                             frame.push(0x01);      // kind = audio
                             frame.push(0);         // flags
                             frame.extend_from_slice(&0u16.to_le_bytes()); // reserved
-                            frame.extend_from_slice(&play_at.to_le_bytes());
-                            frame.extend_from_slice(&pcm);
+                            frame.extend_from_slice(&msg.play_at.to_le_bytes());
+                            frame.extend_from_slice(&msg.pcm);
                             if sender.send(Message::Binary(frame)).await.is_err() { break; }
                         }
                         Err(broadcast::error::RecvError::Lagged(_)) => continue,
@@ -350,10 +383,16 @@ async fn source_conn(socket: WebSocket, shared: SharedState) {
         }
         match msg {
             Message::Binary(bin) => {
-                // Strip the 12-byte header; the relay re-stamps per child.
                 if bin.len() > 12 && bin[0] == 0x01 {
+                    // The master stamps capture-time (its own clock). Translate it
+                    // into relay clock via a STABLE offset so the buffer lead is
+                    // preserved end-to-end and reconnect bursts keep their deadline.
+                    let master_ts = f64::from_le_bytes(bin[4..12].try_into().unwrap());
+                    let buffer_ms = *shared.buffer_ms.lock() as f64;
+                    let offset = shared.update_master_offset(shared.now_ms() - master_ts);
+                    let play_at = master_ts + offset + buffer_ms;
                     let pcm = Arc::new(bin[12..].to_vec());
-                    let _ = shared.audio_tx.send(pcm);
+                    let _ = shared.audio_tx.send(AudioMsg { play_at, pcm });
                 }
             }
             Message::Text(t) => handle_source_text(&t, &shared),

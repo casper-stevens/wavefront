@@ -150,7 +150,7 @@ pub fn start_capture() -> anyhow::Result<CaptureHandle> {
     let in_channels = stream_config.channels as usize;
     let in_rate = stream_config.sample_rate.0;
 
-    let (tx, _rx) = broadcast::channel::<AudioChunk>(64);
+    let (tx, _rx) = broadcast::channel::<AudioChunk>(150); // ~3s send-buffer for reconnect recovery
     let tx_for_handle = tx.clone();
     let stop = Arc::new(AtomicBool::new(false));
     let stop_thread = stop.clone();

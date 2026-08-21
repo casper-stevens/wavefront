@@ -71,8 +71,15 @@ pub async fn run_uplink(
     // session. `capture` stays alive across attempts and is re-subscribed each
     // time. We do NOT replay missed audio — live playback resyncs to "now" on
     // both ends — we just minimise the outage.
+    // Subscribe ONCE, outside the reconnect loop. While a reconnect is in
+    // progress the receiver isn't drained, so the capture broadcast ring holds
+    // the audio captured during the outage (~3s). On reconnect we drain that
+    // backlog first (a burst of still-valid chunks), giving seamless recovery
+    // for any outage shorter than the playback buffer.
+    let mut audio_rx = capture.subscribe();
+
     while !stop.load(Ordering::SeqCst) {
-        match connect_and_run(&ws_url, &state, &capture, &stop).await {
+        match connect_and_run(&ws_url, &state, &mut audio_rx, &stop).await {
             Ok(()) => {}
             Err(e) => eprintln!("wavefront: uplink dropped ({e}); reconnecting…"),
         }
@@ -98,11 +105,19 @@ pub async fn run_uplink(
     Ok(())
 }
 
+fn wall_now_ms() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64()
+        * 1000.0
+}
+
 /// One connect-and-serve attempt; returns when the link drops or `stop` is set.
 async fn connect_and_run(
     ws_url: &str,
     state: &SharedState,
-    capture: &CaptureHandle,
+    audio_rx: &mut tokio::sync::broadcast::Receiver<AudioChunk>,
     stop: &Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
     let (ws_stream, _) = tokio_tungstenite::connect_async(ws_url).await?;
@@ -125,8 +140,6 @@ async fn connect_and_run(
     let (ctrl_tx, mut ctrl_rx) = mpsc::unbounded_channel::<String>();
     state.lock().uplink_ctrl = Some(ctrl_tx);
 
-    let mut audio_rx = capture.subscribe();
-
     loop {
         if stop.load(Ordering::SeqCst) {
             break;
@@ -135,6 +148,12 @@ async fn connect_and_run(
             audio = audio_rx.recv() => {
                 match audio {
                     Ok(chunk) => {
+                        // Skip chunks already older than the buffer: they'd miss
+                        // their play deadline, so bursting them wastes bandwidth
+                        // (relay/clients would drop them anyway).
+                        if wall_now_ms() - chunk.capture_ts_ms > buffer_ms as f64 {
+                            continue;
+                        }
                         let frame = encode_audio_frame(&chunk, buffer_ms);
                         if write.send(Message::Binary(frame)).await.is_err() {
                             break;
@@ -279,13 +298,17 @@ fn handle_relay_text(txt: &str, state: &SharedState) {
 
 /// Encodes an audio chunk into the same binary wire frame used by server.rs
 /// (PROTOCOL.md's child protocol) — the relay ignores/re-stamps `play_at`.
-fn encode_audio_frame(chunk: &AudioChunk, buffer_ms: u32) -> Vec<u8> {
-    let play_at = chunk.capture_ts_ms + buffer_ms as f64;
+fn encode_audio_frame(chunk: &AudioChunk, _buffer_ms: u32) -> Vec<u8> {
+    // Master is the timeline authority: send the raw capture timestamp (master
+    // clock ms). The relay translates it into its own clock via a stable offset
+    // and applies the buffer, so chunks buffered during an outage and burst on
+    // reconnect keep their ORIGINAL play deadline (seamless sub-buffer recovery).
+    let master_ts = chunk.capture_ts_ms;
     let mut buf = Vec::with_capacity(12 + chunk.pcm.len() * 2);
     buf.push(0x01u8); // frame kind = audio
     buf.push(0u8); // flags
     buf.extend_from_slice(&0u16.to_le_bytes()); // reserved
-    buf.extend_from_slice(&play_at.to_le_bytes());
+    buf.extend_from_slice(&master_ts.to_le_bytes());
     for s in &chunk.pcm {
         buf.extend_from_slice(&s.to_le_bytes());
     }
