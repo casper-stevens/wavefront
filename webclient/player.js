@@ -201,12 +201,19 @@
     const rtt = tRecv - t0;
     const offset = t1 + rtt / 2 - tRecv;
 
-    offsetSamples.push(offset);
+    // Keep the offset paired with its RTT.
+    offsetSamples.push({ offset: offset, rtt: rtt });
     if (offsetSamples.length > SYNC_SAMPLES) offsetSamples.shift();
     rttSamples.push(rtt);
     if (rttSamples.length > SYNC_SAMPLES) rttSamples.shift();
 
-    currentOffset = median(offsetSamples);
+    // Min-RTT filtering: the ping with the least round-trip suffered the least
+    // queuing, so its offset estimate is the most accurate and least skewed by
+    // path asymmetry. Using it (rather than a median over noisy samples) tightens
+    // absolute agreement between devices, which is what keeps them in sync.
+    let best = offsetSamples[0];
+    for (const s of offsetSamples) if (s.rtt < best.rtt) best = s;
+    currentOffset = best.offset;
     currentRtt = median(rttSamples);
 
     offsetVal.textContent = currentOffset.toFixed(1) + " ms";
@@ -238,24 +245,37 @@
       chR[i] = samples[i * 2 + 1] / 32768;
     }
 
-    // Continuous-cursor scheduling. TCP delivers chunks in order, so we play
-    // them back-to-back from a moving playHead, kept ~buffer_ms ahead of the
-    // audio clock. Jitter is absorbed by that lead; we only re-anchor when the
-    // cursor underruns (buffer starved) or drifts too far ahead (clock skew),
-    // which is a single small reset rather than continuous stutter.
-    const now = audioCtx.currentTime;
-    const bufferSec = Math.max(0.1, (currentConfig.buffer_ms || 500) / 1000);
+    const playAt = view.getFloat64(4, true);
 
-    if (playHead < now + CHUNK_DUR) {
-      // First chunk, or the buffer ran dry: re-anchor with full lead.
-      if (playHead !== 0) {
+    // Phase-locked continuous cursor. TCP keeps chunks in order, so we play
+    // them back-to-back from a moving playHead for gapless audio — but we
+    // steer that cursor toward the SHARED relay clock so every device converges
+    // on the same wall-clock playback time and can't drift apart.
+    //
+    // `targetCtx` is when THIS chunk should play, in local audio-clock seconds,
+    // derived from the relay's timestamp (already includes the buffer lead) and
+    // this device's own clock offset. Same on every device up to offset error,
+    // and recomputed live each chunk so it also absorbs perf/audio-clock skew.
+    const now = audioCtx.currentTime;
+    const nowMs = performance.now();
+    const localPlayAtMs = playAt - currentOffset;
+    const targetCtx = now + (localPlayAtMs - nowMs) / 1000;
+
+    if (
+      playHead === 0 ||
+      playHead < now + 0.005 ||               // underrun / first chunk
+      Math.abs(playHead - targetCtx) > 0.15    // lost lock: hard re-anchor
+    ) {
+      if (playHead !== 0 && playHead < now + 0.005) {
         droppedCount++;
         droppedVal.textContent = String(droppedCount);
       }
-      playHead = now + bufferSec;
-    } else if (playHead > now + bufferSec * 2 + 0.25) {
-      // Cursor drifted too far ahead (slow DAC / accumulated skew): pull back.
-      playHead = now + bufferSec;
+      playHead = Math.max(targetCtx, now + 0.005);
+    } else {
+      // In lock: gently pull the cursor toward the shared target. Sub-millisecond
+      // per-chunk nudges (5% of the error every 20ms) are inaudible but null out
+      // slow inter-device drift within ~1s.
+      playHead += (targetCtx - playHead) * 0.05;
     }
 
     const startAt = playHead;
