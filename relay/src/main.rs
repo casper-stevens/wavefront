@@ -16,7 +16,7 @@ use axum::{
 use futures_util::{SinkExt, StreamExt};
 use parking_lot::Mutex;
 use serde_json::json;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -69,6 +69,17 @@ struct AudioMsg {
     pcm: Arc<Vec<u8>>,
 }
 
+/// Serialize an AudioMsg into a child wire frame (12-byte header + payload).
+fn build_audio_frame(msg: &AudioMsg) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(12 + msg.pcm.len());
+    frame.push(0x01); // kind = audio
+    frame.push(msg.flags); // codec flags (bit0 = Opus)
+    frame.extend_from_slice(&0u16.to_le_bytes()); // reserved
+    frame.extend_from_slice(&msg.play_at.to_le_bytes());
+    frame.extend_from_slice(&msg.pcm);
+    frame
+}
+
 struct Shared {
     start: Instant,
     next_id: AtomicU32,
@@ -92,6 +103,10 @@ struct Shared {
     active_source: Mutex<Option<u64>>,
     buffer_ms: Mutex<u32>,
     crossover_hz: Mutex<f32>,
+    /// Rolling history of recent chunks (~buffer_ms) so a NEW child can be
+    /// backfilled and jump straight into the shared playback position — instant
+    /// first sound AND in sync, instead of waiting a whole buffer of silence.
+    history: Mutex<VecDeque<AudioMsg>>,
 }
 
 impl Shared {
@@ -185,6 +200,7 @@ async fn main() -> anyhow::Result<()> {
         master_ctrl: Mutex::new(None),
         buffer_ms: Mutex::new(DEFAULT_BUFFER_MS),
         crossover_hz: Mutex::new(220.0),
+        history: Mutex::new(VecDeque::new()),
     });
 
     // 1 Hz roster to the master.
@@ -263,8 +279,8 @@ async fn child_conn(socket: WebSocket, shared: SharedState) {
     let (ctrl_tx, mut ctrl_rx) = mpsc::unbounded_channel::<String>();
     let mut audio_rx = shared.audio_tx.subscribe();
 
-    // Wait for hello (with a timeout) to learn name/kind.
-    let (name, kind) = match tokio::time::timeout(
+    // Wait for hello (with a timeout) to learn name/kind and whether to backfill.
+    let (name, kind, want_backfill) = match tokio::time::timeout(
         std::time::Duration::from_secs(10),
         receiver.next(),
     )
@@ -278,6 +294,9 @@ async fn child_conn(socket: WebSocket, shared: SharedState) {
             (
                 v.get("name").and_then(|x| x.as_str()).unwrap_or("Speaker").to_string(),
                 v.get("kind").and_then(|x| x.as_str()).unwrap_or("browser").to_string(),
+                // Default true (fresh joiners want it); a reconnecting client
+                // that still has buffered audio sends false to avoid doubling.
+                v.get("backfill").and_then(|x| x.as_bool()).unwrap_or(true),
             )
         }
         _ => return,
@@ -323,6 +342,20 @@ async fn child_conn(socket: WebSocket, shared: SharedState) {
         let _ = ctrl_tx.send(c.config_json(crossover_hz, buffer_ms).to_string());
     }
 
+    // Backfill: send the buffered history so this new device jumps straight into
+    // the shared playback position — instant first sound AND in sync, instead of
+    // waiting a whole buffer of silence. Sent before the live outbound task takes
+    // `sender`. The client holds these until its clock offset locks, then plays
+    // the currently-due sample immediately and schedules the rest as its buffer.
+    if want_backfill {
+        let backlog: Vec<AudioMsg> = shared.history.lock().iter().cloned().collect();
+        for msg in &backlog {
+            if sender.send(Message::Binary(build_audio_frame(msg))).await.is_err() {
+                return;
+            }
+        }
+    }
+
     // Outbound task: audio + control, multiplexed to this socket. play_at is
     // already computed by the source handler, so no shared state is needed here.
     let out = tokio::spawn(async move {
@@ -342,12 +375,7 @@ async fn child_conn(socket: WebSocket, shared: SharedState) {
                         Ok(msg) => {
                             // play_at was computed once by the source handler (relay
                             // clock, from the master timeline) — same for every child.
-                            let mut frame = Vec::with_capacity(12 + msg.pcm.len());
-                            frame.push(0x01);      // kind = audio
-                            frame.push(msg.flags); // codec flags (bit0 = Opus)
-                            frame.extend_from_slice(&0u16.to_le_bytes()); // reserved
-                            frame.extend_from_slice(&msg.play_at.to_le_bytes());
-                            frame.extend_from_slice(&msg.pcm);
+                            let frame = build_audio_frame(&msg);
                             if sender.send(Message::Binary(frame)).await.is_err() { break; }
                         }
                         Err(broadcast::error::RecvError::Lagged(_)) => continue,
@@ -461,7 +489,18 @@ async fn source_conn(socket: WebSocket, shared: SharedState) {
                     let offset = shared.update_master_offset(shared.now_ms() - master_ts);
                     let play_at = master_ts + offset + buffer_ms;
                     let pcm = Arc::new(bin[12..].to_vec());
-                    let _ = shared.audio_tx.send(AudioMsg { play_at, flags, pcm });
+                    let msg = AudioMsg { play_at, flags, pcm };
+                    // Keep it in the history ring for backfilling new joiners,
+                    // pruning chunks already past their play time.
+                    {
+                        let now = shared.now_ms();
+                        let mut hist = shared.history.lock();
+                        hist.push_back(msg.clone());
+                        while hist.front().map_or(false, |m| m.play_at < now - 200.0) {
+                            hist.pop_front();
+                        }
+                    }
+                    let _ = shared.audio_tx.send(msg);
                 }
             }
             Message::Text(t) => handle_source_text(&t, &shared),

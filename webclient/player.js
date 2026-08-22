@@ -72,6 +72,11 @@
   let kfLastMs = 0; // performance.now() of the last filter update
   const KF_Q = 1e-9; // process-noise density (oscillator volatility), tunable
 
+  // Audio frames that arrive before the clock offset is established (notably the
+  // relay's join backfill burst) are held here and replayed once offset locks,
+  // so they schedule against the correct shared clock instead of offset=0.
+  let pendingFrames = [];
+
   let scheduledCount = 0;
   let droppedCount = 0;
   let glitchCount = 0; // audio-session interruptions (iOS pauses the context)
@@ -464,6 +469,14 @@ registerProcessor('wavefront-player', WavefrontPlayer);
       offsetVal.textContent = kfTheta.toFixed(1) + " ms";
       rttVal.textContent = currentRtt.toFixed(1) + " ms";
       setStatus("synced", "synced");
+      // Offset is now known — replay any frames held during warmup (the relay's
+      // join backfill), which now schedule against the correct shared clock and
+      // give instant first sound at the shared position.
+      if (pendingFrames.length) {
+        const q = pendingFrames;
+        pendingFrames = [];
+        for (let i = 0; i < q.length; i++) handleAudioFrame(q[i]);
+      }
       return;
     }
 
@@ -540,6 +553,12 @@ registerProcessor('wavefront-player', WavefrontPlayer);
     if (buffer.byteLength < HEADER_BYTES) return;
     const view = new DataView(buffer);
     if (view.getUint8(0) !== 0x01) return;
+    // Hold frames until the clock offset is known (see pendingFrames): playAt is
+    // in relay-clock ms and needs the offset to map into local time.
+    if (!offsetInit) {
+      if (pendingFrames.length < 800) pendingFrames.push(buffer);
+      return;
+    }
     const flags = view.getUint8(1);
     const playAt = view.getFloat64(4, true);
 
@@ -714,7 +733,22 @@ registerProcessor('wavefront-player', WavefrontPlayer);
 
     ws.onopen = function () {
       reconnectDelay = RECONNECT_MIN_MS;
-      ws.send(JSON.stringify({ type: "hello", name: clientName, kind: "browser" }));
+      // Request the relay's history backfill only when our buffer is actually
+      // empty (fresh join, or a drop that outlasted the buffer). A reconnecting
+      // client that still has buffered audio must NOT be backfilled or it would
+      // double-schedule and echo against what's already queued.
+      const bufAhead = workletReady
+        ? wlAvailable / ctxRate
+        : audioCtx
+          ? playHead - audioCtx.currentTime
+          : 0;
+      const needBackfill = bufAhead < 0.5;
+      ws.send(JSON.stringify({
+        type: "hello",
+        name: clientName,
+        kind: "browser",
+        backfill: needBackfill,
+      }));
       sendPing();
       pingTimer = setInterval(sendPing, PING_INTERVAL_MS);
     };
