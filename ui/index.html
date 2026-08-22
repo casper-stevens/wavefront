@@ -95,6 +95,19 @@
         </div>
       </div>
 
+      <div class="toolbar-divider"></div>
+
+      <div class="switch-row">
+        <label class="switch">
+          <input type="checkbox" id="compressToggle">
+          <span class="track"><span class="thumb"></span></span>
+        </label>
+        <div>
+          <div class="sr-label">Compress (Opus)</div>
+          <div class="sr-sub">~15× less data — for weak/mixed networks</div>
+        </div>
+      </div>
+
       <div class="spacer"></div>
 
       <button class="join-url-chip" id="joinUrlChip" type="button" title="Click to copy">
@@ -166,7 +179,7 @@
           </div>
           <div class="xover-body">
             <div class="xover-canvas-wrap">
-              <input type="range" min="200" max="2000" step="50" value="1000" id="bufferSlider">
+              <input type="range" min="200" max="10000" step="50" value="1000" id="bufferSlider">
               <div class="hint" style="margin-top:6px;">Lower = tighter sync to picture, less tolerant of network hiccups. Higher = more robust, more delay.</div>
             </div>
             <div class="xfreq-readout">

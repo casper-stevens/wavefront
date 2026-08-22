@@ -65,6 +65,7 @@ impl Child {
 #[derive(Clone)]
 struct AudioMsg {
     play_at: f64,
+    flags: u8, // codec flags from the source frame (bit0 = Opus), passed through
     pcm: Arc<Vec<u8>>,
 }
 
@@ -343,7 +344,7 @@ async fn child_conn(socket: WebSocket, shared: SharedState) {
                             // clock, from the master timeline) — same for every child.
                             let mut frame = Vec::with_capacity(12 + msg.pcm.len());
                             frame.push(0x01);      // kind = audio
-                            frame.push(0);         // flags
+                            frame.push(msg.flags); // codec flags (bit0 = Opus)
                             frame.extend_from_slice(&0u16.to_le_bytes()); // reserved
                             frame.extend_from_slice(&msg.play_at.to_le_bytes());
                             frame.extend_from_slice(&msg.pcm);
@@ -455,11 +456,12 @@ async fn source_conn(socket: WebSocket, shared: SharedState) {
                     // into relay clock via a STABLE offset so the buffer lead is
                     // preserved end-to-end and reconnect bursts keep their deadline.
                     let master_ts = f64::from_le_bytes(bin[4..12].try_into().unwrap());
+                    let flags = bin[1]; // codec flags, passed through to children
                     let buffer_ms = *shared.buffer_ms.lock() as f64;
                     let offset = shared.update_master_offset(shared.now_ms() - master_ts);
                     let play_at = master_ts + offset + buffer_ms;
                     let pcm = Arc::new(bin[12..].to_vec());
-                    let _ = shared.audio_tx.send(AudioMsg { play_at, pcm });
+                    let _ = shared.audio_tx.send(AudioMsg { play_at, flags, pcm });
                 }
             }
             Message::Text(t) => handle_source_text(&t, &shared),

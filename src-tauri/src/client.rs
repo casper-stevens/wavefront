@@ -52,6 +52,8 @@ struct ClientShared {
     config: Mutex<ClientConfig>,
     offset_ms: Mutex<f64>,
     offset_samples: Mutex<VecDeque<f64>>,
+    /// Opus decoder (24kHz stereo) for compressed frames; None if unavailable.
+    opus: Mutex<Option<audiopus::coder::Decoder>>,
 }
 
 fn local_hostname() -> String {
@@ -117,6 +119,10 @@ pub async fn run_client(
         config: Mutex::new(ClientConfig::default()),
         offset_ms: Mutex::new(0.0),
         offset_samples: Mutex::new(VecDeque::with_capacity(15)),
+        opus: Mutex::new(
+            audiopus::coder::Decoder::new(audiopus::SampleRate::Hz24000, audiopus::Channels::Stereo)
+                .ok(),
+        ),
     });
 
     // Spawn the cpal output stream on its own thread (cpal streams are !Send).
@@ -263,14 +269,28 @@ fn handle_binary(bin: &[u8], shared: &Arc<ClientShared>, _start: &Instant) {
         return;
     }
     let play_at = f64::from_le_bytes(bin[4..12].try_into().unwrap());
-    let pcm_bytes = &bin[12..];
-    let pcm_24k: Vec<i16> = pcm_bytes
-        .chunks_exact(2)
-        .map(|c| i16::from_le_bytes([c[0], c[1]]))
-        .collect();
-    // The wire stream is 24kHz stereo (half-rate to save bandwidth); the output
-    // stream and DSP run at 48kHz, so upsample 2x here. 2x linear interpolation
-    // is plenty for the low-fidelity playback this targets.
+    let opus_flag = bin[1] & 0x01 != 0;
+    let payload = &bin[12..];
+
+    // Decode to 24kHz stereo interleaved i16, then upsample 2x to the 48kHz
+    // output/DSP rate. Opus and raw-PCM frames are distinguished by the flag.
+    let pcm_24k: Vec<i16> = if opus_flag {
+        let mut dec = shared.opus.lock();
+        let Some(dec) = dec.as_mut() else { return };
+        let mut out = vec![0i16; 2880 * 2]; // up to 120ms stereo headroom
+        match dec.decode(Some(payload), &mut out, false) {
+            Ok(frames) => {
+                out.truncate(frames * 2);
+                out
+            }
+            Err(_) => return,
+        }
+    } else {
+        payload
+            .chunks_exact(2)
+            .map(|c| i16::from_le_bytes([c[0], c[1]]))
+            .collect()
+    };
     let pcm = upsample_2x_stereo(&pcm_24k);
 
     let offset = *shared.offset_ms.lock();

@@ -59,6 +59,7 @@
       setBuffer: (ms) => invoke("set_buffer", { ms }),
       setMasterVolume: (v) => invoke("set_master_volume", { v }),
       setMasterPlays: (on) => invoke("set_master_plays", { on }),
+      setCompress: (on) => invoke("set_compress", { on }),
       getStatus: () => invoke("get_status"),
       onState: (cb) => {
         TAURI.event.listen("wavefront://state", (evt) => cb(evt.payload));
@@ -167,6 +168,7 @@
         emit();
         return Promise.resolve();
       },
+      setCompress: (on) => { state.compress = on; emit(); return Promise.resolve(); },
       setMasterPlays: (on) => {
         state.master_plays = on;
         emit();
@@ -304,6 +306,11 @@
 
   masterRoleToggle.addEventListener("change", () => {
     backend.setMasterPlays(masterRoleToggle.checked);
+  });
+
+  const compressToggle = document.getElementById("compressToggle");
+  compressToggle.addEventListener("change", () => {
+    backend.setCompress(compressToggle.checked);
   });
 
   const debouncedMasterVolume = debounce((v) => backend.setMasterVolume(v), 100);
@@ -633,6 +640,7 @@
     }
 
     masterRoleToggle.checked = !!state.master_plays;
+    if (document.activeElement !== compressToggle) compressToggle.checked = !!state.compress;
 
     const addr = state.addr || "";
     // The backend already includes the scheme (http:// or https://); only add

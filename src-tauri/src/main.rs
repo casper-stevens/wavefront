@@ -265,7 +265,7 @@ async fn set_crossover(app: AppHandle, data: State<'_, AppData>, hz: f32) -> Res
 
 #[tauri::command]
 async fn set_buffer(app: AppHandle, data: State<'_, AppData>, ms: u32) -> Result<(), String> {
-    let ms = ms.clamp(100, 3000);
+    let ms = ms.clamp(100, 10000);
     {
         let mut st = data.state.lock();
         st.buffer_ms = ms;
@@ -280,6 +280,15 @@ async fn set_buffer(app: AppHandle, data: State<'_, AppData>, ms: u32) -> Result
             }
         }
     }
+    emit_state(&app, &data.state.clone());
+    Ok(())
+}
+
+#[tauri::command]
+async fn set_compress(app: AppHandle, data: State<'_, AppData>, on: bool) -> Result<(), String> {
+    // Master-local: the uplink's encoder reads this per chunk and flags each
+    // frame's codec, so clients switch automatically — no relay/client command.
+    data.state.lock().compress = on;
     emit_state(&app, &data.state.clone());
     Ok(())
 }
@@ -410,6 +419,7 @@ fn main() {
             set_client_config,
             set_crossover,
             set_buffer,
+            set_compress,
             set_master_volume,
             set_master_plays,
             start_client,

@@ -279,6 +279,23 @@
   const USE_WORKLET = /[?&]engine=worklet\b/.test(location.search);
   let workletNode = null;
   let workletReady = false;
+  let opusDecoder = null; // WebCodecs AudioDecoder for compressed frames
+
+  // Set up an Opus decoder if the master ever sends compressed frames. Raw
+  // packets, decoded via WebCodecs (no external WASM). Absent on browsers
+  // without WebCodecs AudioDecoder — those simply can't play Opus frames.
+  function setupOpusDecoder() {
+    if (typeof AudioDecoder === "undefined") return;
+    try {
+      opusDecoder = new AudioDecoder({
+        output: onOpusDecoded,
+        error: function (e) { /* transient decode error; keep going */ },
+      });
+      opusDecoder.configure({ codec: "opus", sampleRate: 24000, numberOfChannels: 2 });
+    } catch (e) {
+      opusDecoder = null;
+    }
+  }
   let wlWrittenFrames = 0;      // frames (ctxRate) written to the worklet ring
   let wlAvailable = 0;          // last reported buffered frames in the ring
   let wlWriteHeadPlayAtMs = 0;  // shared-clock play_at at the write head
@@ -498,67 +515,102 @@ registerProcessor('wavefront-player', WavefrontPlayer);
   // Binary audio frame handling
   // ---------------------------------------------------------------------
 
-  function handleAudioFrame(buffer) {
-    if (buffer.byteLength < FRAME_BYTES) return;
-    const view = new DataView(buffer);
-
-    const kind = view.getUint8(0);
-    if (kind !== 0x01) return;
-
-    // Decode s16 stereo and build the AudioBuffer AT THE CONTEXT'S NATIVE RATE,
-    // resampling from 24kHz here in JS. Creating a 24kHz buffer and letting Web
-    // Audio resample every 20ms chunk on playback is expensive on WebKit
-    // (Safari / iOS) and was a stutter source; a cheap linear resample here is
-    // far lighter. Buffer duration stays 20ms either way, so the scheduler math
-    // is unchanged.
-    const samples = new Int16Array(buffer, HEADER_BYTES, FRAMES_PER_CHUNK * 2);
-    const outFrames = Math.max(1, Math.round((FRAMES_PER_CHUNK * ctxRate) / SAMPLE_RATE));
-    const playAt = view.getFloat64(4, true);
-
-    // Decode + resample to context-rate planar L/R once. In worklet mode these
-    // are transferred to the audio thread; otherwise copied into an AudioBuffer.
+  // Linear-resample planar Float32 L/R from srcRate to the context rate.
+  function resampleToCtx(srcL, srcR, srcRate) {
+    const srcFrames = srcL.length;
+    if (srcRate === ctxRate || srcFrames === 0) return { chL: srcL, chR: srcR };
+    const outFrames = Math.max(1, Math.round((srcFrames * ctxRate) / srcRate));
     const chL = new Float32Array(outFrames);
     const chR = new Float32Array(outFrames);
-    if (outFrames === FRAMES_PER_CHUNK) {
-      for (let i = 0; i < FRAMES_PER_CHUNK; i++) {
-        chL[i] = samples[i * 2] / 32768;
-        chR[i] = samples[i * 2 + 1] / 32768;
-      }
-    } else {
-      const step = SAMPLE_RATE / ctxRate; // input samples per output sample
-      for (let i = 0; i < outFrames; i++) {
-        const src = i * step;
-        const i0 = src | 0;
-        const frac = src - i0;
-        const i1 = i0 + 1 < FRAMES_PER_CHUNK ? i0 + 1 : FRAMES_PER_CHUNK - 1;
-        chL[i] = (samples[i0 * 2] * (1 - frac) + samples[i1 * 2] * frac) / 32768;
-        chR[i] = (samples[i0 * 2 + 1] * (1 - frac) + samples[i1 * 2 + 1] * frac) / 32768;
-      }
+    const step = srcRate / ctxRate;
+    for (let i = 0; i < outFrames; i++) {
+      const s = i * step;
+      const i0 = s | 0;
+      const frac = s - i0;
+      const i1 = i0 + 1 < srcFrames ? i0 + 1 : srcFrames - 1;
+      chL[i] = srcL[i0] * (1 - frac) + srcL[i1] * frac;
+      chR[i] = srcR[i0] * (1 - frac) + srcR[i1] * frac;
+    }
+    return { chL, chR };
+  }
+
+  // Dispatch a wire frame by codec: raw 24kHz PCM or Opus (WebCodecs). Both
+  // paths converge on scheduleCtxChunk with context-rate planar audio.
+  function handleAudioFrame(buffer) {
+    if (buffer.byteLength < HEADER_BYTES) return;
+    const view = new DataView(buffer);
+    if (view.getUint8(0) !== 0x01) return;
+    const flags = view.getUint8(1);
+    const playAt = view.getFloat64(4, true);
+
+    if (flags & 0x01) {
+      // Opus: hand the packet to the async WebCodecs decoder (output callback
+      // finishes the job). Carry playAt in the chunk timestamp (µs).
+      if (!opusDecoder) return; // no decoder on this browser -> can't play Opus
+      try {
+        opusDecoder.decode(
+          new EncodedAudioChunk({
+            type: "key",
+            timestamp: Math.round(playAt * 1000),
+            data: new Uint8Array(buffer, HEADER_BYTES),
+          })
+        );
+      } catch (e) { /* decoder not ready / bad packet */ }
+      return;
     }
 
+    // Raw 24kHz s16 stereo PCM.
+    if (buffer.byteLength < FRAME_BYTES) return;
+    const samples = new Int16Array(buffer, HEADER_BYTES, FRAMES_PER_CHUNK * 2);
+    const srcL = new Float32Array(FRAMES_PER_CHUNK);
+    const srcR = new Float32Array(FRAMES_PER_CHUNK);
+    for (let i = 0; i < FRAMES_PER_CHUNK; i++) {
+      srcL[i] = samples[i * 2] / 32768;
+      srcR[i] = samples[i * 2 + 1] / 32768;
+    }
+    const r = resampleToCtx(srcL, srcR, SAMPLE_RATE);
+    scheduleCtxChunk(r.chL, r.chR, playAt);
+  }
+
+  // WebCodecs Opus decode callback: convert to planar Float32 and schedule.
+  function onOpusDecoded(audioData) {
+    try {
+      const srcRate = audioData.sampleRate;
+      const n = audioData.numberOfFrames;
+      const srcL = new Float32Array(n);
+      const srcR = new Float32Array(n);
+      audioData.copyTo(srcL, { planeIndex: 0, format: "f32-planar" });
+      if (audioData.numberOfChannels > 1) {
+        audioData.copyTo(srcR, { planeIndex: 1, format: "f32-planar" });
+      } else {
+        srcR.set(srcL);
+      }
+      const playAt = audioData.timestamp / 1000; // µs -> ms
+      audioData.close();
+      const r = resampleToCtx(srcL, srcR, srcRate);
+      scheduleCtxChunk(r.chL, r.chR, playAt);
+    } catch (e) {
+      try { audioData.close(); } catch (_) {}
+    }
+  }
+
+  // Schedule one context-rate stereo chunk against the shared clock.
+  function scheduleCtxChunk(chL, chR, playAt) {
     // Worklet engine (opt-in): hand the PCM to the audio thread and return.
     if (workletReady) {
       feedWorklet(chL, chR, playAt, performance.now());
       return;
     }
 
+    const outFrames = chL.length;
     const audioBuffer = audioCtx.createBuffer(2, outFrames, ctxRate);
     audioBuffer.getChannelData(0).set(chL);
     audioBuffer.getChannelData(1).set(chR);
 
-    // Phase-locked continuous cursor. TCP keeps chunks in order, so we play
-    // them back-to-back from a moving playHead for gapless audio — but we
-    // steer that cursor toward the SHARED relay clock so every device converges
-    // on the same wall-clock playback time and can't drift apart.
-    //
-    // `targetCtx` is when THIS chunk should play, in local audio-clock seconds,
-    // derived from the relay's timestamp (already includes the buffer lead) and
-    // this device's own clock offset. Same on every device up to offset error,
-    // and recomputed live each chunk so it also absorbs perf/audio-clock skew.
+    // Phase-locked continuous cursor (see design notes): steer playback toward
+    // the shared relay clock so every device converges and can't drift.
     const now = audioCtx.currentTime;
     const nowMs = performance.now();
-    // Low-pass the audio-vs-perf clock offset so a coarse currentTime doesn't
-    // jitter the target (this was the Linux/Firefox stutter).
     const kInstant = now - nowMs / 1000;
     if (ctxPerfK === null) ctxPerfK = kInstant;
     else ctxPerfK += (kInstant - ctxPerfK) * 0.05;
@@ -857,6 +909,7 @@ registerProcessor('wavefront-player', WavefrontPlayer);
     joinCtxTime = audioCtx.currentTime;
 
     buildAudioGraph();
+    setupOpusDecoder();
     if (USE_WORKLET) {
       const ok = await setupWorklet();
       if (!ok) console.warn("wavefront: worklet engine unavailable, using scheduler");

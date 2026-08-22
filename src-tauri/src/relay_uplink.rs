@@ -8,6 +8,8 @@
 
 use crate::capture::{AudioChunk, CaptureHandle};
 use crate::state::{ClientConfig, ClientKind, Pan, RelayChild, Role, SharedState};
+use audiopus::coder::Encoder as OpusEncoder;
+use audiopus::{Application, Channels, SampleRate};
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::json;
@@ -140,6 +142,13 @@ async fn connect_and_run(
     let (ctrl_tx, mut ctrl_rx) = mpsc::unbounded_channel::<String>();
     state.lock().uplink_ctrl = Some(ctrl_tx);
 
+    // Opus encoder for compressed mode (24kHz stereo, matching capture). Created
+    // per connection; a reconnect just resets it (Opus is self-recovering).
+    let mut opus = OpusEncoder::new(SampleRate::Hz24000, Channels::Stereo, Application::Audio).ok();
+    if let Some(enc) = opus.as_mut() {
+        let _ = enc.set_bitrate(audiopus::Bitrate::BitsPerSecond(64_000));
+    }
+
     loop {
         if stop.load(Ordering::SeqCst) {
             break;
@@ -154,7 +163,8 @@ async fn connect_and_run(
                         if wall_now_ms() - chunk.capture_ts_ms > buffer_ms as f64 {
                             continue;
                         }
-                        let frame = encode_audio_frame(&chunk, buffer_ms);
+                        let compress = state.lock().compress;
+                        let frame = encode_audio_frame(&chunk, compress, opus.as_mut());
                         if write.send(Message::Binary(frame)).await.is_err() {
                             break;
                         }
@@ -296,18 +306,38 @@ fn handle_relay_text(txt: &str, state: &SharedState) {
     }
 }
 
-/// Encodes an audio chunk into the same binary wire frame used by server.rs
-/// (PROTOCOL.md's child protocol) — the relay ignores/re-stamps `play_at`.
-fn encode_audio_frame(chunk: &AudioChunk, _buffer_ms: u32) -> Vec<u8> {
-    // Master is the timeline authority: send the raw capture timestamp (master
-    // clock ms). The relay translates it into its own clock via a stable offset
-    // and applies the buffer, so chunks buffered during an outage and burst on
-    // reconnect keep their ORIGINAL play deadline (seamless sub-buffer recovery).
+/// Encodes an audio chunk into a binary wire frame. Header (12 bytes): kind
+/// (0x01), flags (bit0 = 1 → Opus payload, else 24kHz s16 PCM), u16 reserved,
+/// f64 master capture timestamp. The relay re-stamps play_at but preserves the
+/// flags byte so clients know how to decode. `master_ts` being the raw capture
+/// clock is what makes seamless sub-buffer reconnect recovery possible.
+fn encode_audio_frame(
+    chunk: &AudioChunk,
+    compress: bool,
+    opus: Option<&mut OpusEncoder>,
+) -> Vec<u8> {
     let master_ts = chunk.capture_ts_ms;
+
+    // Try Opus when requested and available; fall back to PCM on any error.
+    if compress {
+        if let Some(enc) = opus {
+            let mut out = [0u8; 4000];
+            if let Ok(n) = enc.encode(&chunk.pcm, &mut out) {
+                let mut buf = Vec::with_capacity(12 + n);
+                buf.push(0x01u8);
+                buf.push(0x01u8); // flags: Opus
+                buf.extend_from_slice(&0u16.to_le_bytes());
+                buf.extend_from_slice(&master_ts.to_le_bytes());
+                buf.extend_from_slice(&out[..n]);
+                return buf;
+            }
+        }
+    }
+
     let mut buf = Vec::with_capacity(12 + chunk.pcm.len() * 2);
-    buf.push(0x01u8); // frame kind = audio
-    buf.push(0u8); // flags
-    buf.extend_from_slice(&0u16.to_le_bytes()); // reserved
+    buf.push(0x01u8);
+    buf.push(0x00u8); // flags: PCM
+    buf.extend_from_slice(&0u16.to_le_bytes());
     buf.extend_from_slice(&master_ts.to_le_bytes());
     for s in &chunk.pcm {
         buf.extend_from_slice(&s.to_le_bytes());
