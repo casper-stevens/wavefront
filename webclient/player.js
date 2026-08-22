@@ -755,14 +755,17 @@ registerProcessor('wavefront-player', WavefrontPlayer);
     };
 
     ws.onclose = function () {
-      setStatus("dropped", "dropped");
+      // Connection dropped — but DON'T stop playback. Up to `buffer` seconds of
+      // audio is already scheduled/buffered and should keep playing; that's the
+      // whole point of the buffer. Keep the clock estimate, cursor, worklet ring
+      // and output gain intact and just reconnect quietly. If the gap outlasts
+      // the buffer, the scheduler underruns and re-anchors on its own once
+      // frames resume — with the master timeline preserved, short gaps refill
+      // seamlessly. (Previously we muted + flushed here, which killed a full
+      // buffer on any blip.)
+      setStatus("reconnecting", "connecting");
       clearInterval(pingTimer);
-      minRtt = null;
-      offsetInit = false;
-      playHead = 0; // re-anchor the cursor on reconnect
-      ctxPerfK = null;
-      flushWorklet();
-      markUnreliable(1.0); // silent until re-synced after reconnect
+      pingTimer = null;
       if (joined) scheduleReconnect();
     };
 
