@@ -56,6 +56,7 @@
       stopClient: () => invoke("stop_client"),
       setClientConfig: (id, role, pan, gain) => invoke("set_client_config", { id, role, pan, gain }),
       setCrossover: (hz) => invoke("set_crossover", { hz }),
+      setBuffer: (ms) => invoke("set_buffer", { ms }),
       setMasterVolume: (v) => invoke("set_master_volume", { v }),
       setMasterPlays: (on) => invoke("set_master_plays", { on }),
       getStatus: () => invoke("get_status"),
@@ -153,6 +154,11 @@
       },
       setCrossover: (hz) => {
         state.crossover_hz = hz;
+        emit();
+        return Promise.resolve();
+      },
+      setBuffer: (ms) => {
+        state.buffer_ms = ms;
         emit();
         return Promise.resolve();
       },
@@ -318,6 +324,15 @@
     xoverReadout.textContent = val;
     drawCrossover(freqToNorm(val, xoverSlider));
     debouncedCrossover(val);
+  });
+
+  const bufferSlider = document.getElementById("bufferSlider");
+  const bufferReadout = document.getElementById("bufferReadout");
+  const debouncedBuffer = debounce((ms) => backend.setBuffer(ms), 150);
+  bufferSlider.addEventListener("input", () => {
+    const val = parseInt(bufferSlider.value, 10);
+    bufferReadout.textContent = val;
+    debouncedBuffer(val);
   });
 
   function debounce(fn, ms) {
@@ -648,6 +663,14 @@
       xoverReadout.textContent = hz;
       drawCrossover(freqToNorm(hz, xoverSlider));
       xoverInitialized = true;
+    }
+
+    const bufferSlider2 = document.getElementById("bufferSlider");
+    const bufferReadout2 = document.getElementById("bufferReadout");
+    if (bufferSlider2 && document.activeElement !== bufferSlider2) {
+      const ms = state.buffer_ms ?? 1000;
+      bufferSlider2.value = ms;
+      bufferReadout2.textContent = ms;
     }
 
     const syncedCount = clients.filter((c) => c.synced).length;

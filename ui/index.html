@@ -158,6 +158,23 @@
             </div>
           </div>
         </div>
+
+        <div class="panel">
+          <div class="panel-head">
+            <h2>Buffer</h2>
+            <span class="hint">delay vs. jitter tolerance</span>
+          </div>
+          <div class="xover-body">
+            <div class="xover-canvas-wrap">
+              <input type="range" min="200" max="2000" step="50" value="1000" id="bufferSlider">
+              <div class="hint" style="margin-top:6px;">Lower = tighter sync to picture, less tolerant of network hiccups. Higher = more robust, more delay.</div>
+            </div>
+            <div class="xfreq-readout">
+              <div class="big mono" id="bufferReadout">1000</div>
+              <div class="unit">ms</div>
+            </div>
+          </div>
+        </div>
       </main>
     </div>
 

@@ -518,6 +518,17 @@ fn handle_source_text(t: &str, shared: &SharedState) {
                 let _ = c.ctrl.send(c.config_json(crossover_hz, buffer_ms).to_string());
             }
         }
+        Some("set_buffer") => {
+            // Live buffer change: used immediately for play_at stamping (read
+            // per chunk) and pushed to children so their status/prime updates.
+            if let Some(ms) = v.get("ms").and_then(|x| x.as_u64()) {
+                *shared.buffer_ms.lock() = ms as u32;
+            }
+            let (crossover_hz, buffer_ms) = (*shared.crossover_hz.lock(), *shared.buffer_ms.lock());
+            for c in shared.children.lock().values() {
+                let _ = c.ctrl.send(c.config_json(crossover_hz, buffer_ms).to_string());
+            }
+        }
         _ => {}
     }
 }

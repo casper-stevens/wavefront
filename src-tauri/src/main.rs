@@ -263,6 +263,27 @@ async fn set_crossover(app: AppHandle, data: State<'_, AppData>, hz: f32) -> Res
     Ok(())
 }
 
+#[tauri::command]
+async fn set_buffer(app: AppHandle, data: State<'_, AppData>, ms: u32) -> Result<(), String> {
+    let ms = ms.clamp(100, 3000);
+    {
+        let mut st = data.state.lock();
+        st.buffer_ms = ms;
+        if st.mode == Mode::RelayHost {
+            if let Some(tx) = &st.uplink_ctrl {
+                let msg = serde_json::json!({"type": "set_buffer", "ms": ms});
+                let _ = tx.send(msg.to_string());
+            }
+        } else {
+            for c in st.clients.values() {
+                let _ = c.sender.send(ClientMsg::Config(c.config));
+            }
+        }
+    }
+    emit_state(&app, &data.state.clone());
+    Ok(())
+}
+
 fn role_str(role: Role) -> &'static str {
     match role {
         Role::Sub => "sub",
@@ -388,6 +409,7 @@ fn main() {
             stop_master,
             set_client_config,
             set_crossover,
+            set_buffer,
             set_master_volume,
             set_master_plays,
             start_client,
