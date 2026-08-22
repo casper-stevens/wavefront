@@ -180,7 +180,7 @@ impl Default for AppState {
             buffer_ms: 1000,
             master_volume: 1.0,
             master_plays: true,
-            compress: false,
+            compress: true,
             capture_source: String::new(),
             warnings: Vec::new(),
             client_addr: None,
