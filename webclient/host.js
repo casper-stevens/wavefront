@@ -73,6 +73,17 @@
   async function start() {
     const { ws: wsUrl, pub } = normalizeRelay(relayInput.value);
 
+    // Hard browser requirement: tab/screen audio capture needs a SECURE context
+    // (HTTPS or localhost). Over plain http://<ip> it's simply unavailable.
+    if (!window.isSecureContext || !navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
+      setStatus("needs HTTPS", "err");
+      hint.innerHTML =
+        "<b>Browser hosting needs HTTPS.</b> Tab/screen audio capture is blocked on plain http://. " +
+        "Serve the relay over HTTPS (or run the host page from localhost) and reload. " +
+        "Speakers still work over http — only the host needs a secure page.";
+      return;
+    }
+
     // 1) Capture tab/screen audio.
     try {
       displayStream = await navigator.mediaDevices.getDisplayMedia({
