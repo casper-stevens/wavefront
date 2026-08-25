@@ -91,6 +91,7 @@ host device is already playing.
 
 ## License
 
-Proprietary — **All Rights Reserved**. This source is publicly viewable for
-reference only; **no** right to use, copy, modify, or distribute is granted.
-See [LICENSE](LICENSE).
+[PolyForm Noncommercial License 1.0.0](LICENSE). You may use, modify, and
+share this software for any **noncommercial** purpose. **Commercial use —
+including selling it or selling modified versions — is not permitted** without
+a separate license from the copyright holder.
