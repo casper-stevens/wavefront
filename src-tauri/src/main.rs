@@ -284,15 +284,6 @@ async fn set_buffer(app: AppHandle, data: State<'_, AppData>, ms: u32) -> Result
     Ok(())
 }
 
-#[tauri::command]
-async fn set_compress(app: AppHandle, data: State<'_, AppData>, on: bool) -> Result<(), String> {
-    // Master-local: the uplink's encoder reads this per chunk and flags each
-    // frame's codec, so clients switch automatically — no relay/client command.
-    data.state.lock().compress = on;
-    emit_state(&app, &data.state.clone());
-    Ok(())
-}
-
 fn role_str(role: Role) -> &'static str {
     match role {
         Role::Sub => "sub",
@@ -419,7 +410,6 @@ fn main() {
             set_client_config,
             set_crossover,
             set_buffer,
-            set_compress,
             set_master_volume,
             set_master_plays,
             start_client,

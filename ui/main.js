@@ -55,11 +55,9 @@
       startClient: (addr) => invoke("start_client", { addr }),
       stopClient: () => invoke("stop_client"),
       setClientConfig: (id, role, pan, gain) => invoke("set_client_config", { id, role, pan, gain }),
-      setCrossover: (hz) => invoke("set_crossover", { hz }),
       setBuffer: (ms) => invoke("set_buffer", { ms }),
       setMasterVolume: (v) => invoke("set_master_volume", { v }),
       setMasterPlays: (on) => invoke("set_master_plays", { on }),
-      setCompress: (on) => invoke("set_compress", { on }),
       getStatus: () => invoke("get_status"),
       onState: (cb) => {
         TAURI.event.listen("wavefront://state", (evt) => cb(evt.payload));
@@ -153,11 +151,6 @@
         emit();
         return Promise.resolve();
       },
-      setCrossover: (hz) => {
-        state.crossover_hz = hz;
-        emit();
-        return Promise.resolve();
-      },
       setBuffer: (ms) => {
         state.buffer_ms = ms;
         emit();
@@ -168,7 +161,6 @@
         emit();
         return Promise.resolve();
       },
-      setCompress: (on) => { state.compress = on; emit(); return Promise.resolve(); },
       setMasterPlays: (on) => {
         state.master_plays = on;
         emit();
@@ -210,7 +202,6 @@
 
   // Dashboard
   const captureLabel = document.getElementById("captureLabel");
-  const masterVolumeEl = document.getElementById("masterVolume");
   const masterRoleToggle = document.getElementById("masterRoleToggle");
   const joinUrlChip = document.getElementById("joinUrlChip");
   const joinUrlText = document.getElementById("joinUrlText");
@@ -222,9 +213,6 @@
   const deviceList = document.getElementById("deviceList");
   const onlineCount = document.getElementById("onlineCount");
   const room = document.getElementById("room");
-  const xoverCanvas = document.getElementById("xoverCanvas");
-  const xoverSlider = document.getElementById("xoverSlider");
-  const xoverReadout = document.getElementById("xoverReadout");
   const syncDot = document.getElementById("syncDot");
   const syncSummary = document.getElementById("syncSummary");
   const netSummary = document.getElementById("netSummary");
@@ -308,29 +296,11 @@
     backend.setMasterPlays(masterRoleToggle.checked);
   });
 
-  const compressToggle = document.getElementById("compressToggle");
-  compressToggle.addEventListener("change", () => {
-    backend.setCompress(compressToggle.checked);
-  });
-
-  const debouncedMasterVolume = debounce((v) => backend.setMasterVolume(v), 100);
-  masterVolumeEl.addEventListener("input", () => {
-    debouncedMasterVolume(parseInt(masterVolumeEl.value, 10) / 100);
-  });
-
   joinUrlChip.addEventListener("click", () => {
     const url = joinUrlText.textContent;
     if (navigator.clipboard && url && url !== "http://—") {
       navigator.clipboard.writeText(url).catch(() => {});
     }
-  });
-
-  const debouncedCrossover = debounce((hz) => backend.setCrossover(hz), 100);
-  xoverSlider.addEventListener("input", () => {
-    const val = parseInt(xoverSlider.value, 10);
-    xoverReadout.textContent = val;
-    drawCrossover(freqToNorm(val, xoverSlider));
-    debouncedCrossover(val);
   });
 
   const bufferSlider = document.getElementById("bufferSlider");
@@ -353,59 +323,6 @@
         fn(...lastArgs);
       }, ms);
     };
-  }
-
-  // ---------------------------------------------------------------------
-  // Crossover canvas (identical curve math to the mockup)
-  // ---------------------------------------------------------------------
-
-  const xctx = xoverCanvas.getContext("2d");
-
-  function styleVar(name) {
-    return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
-  }
-
-  function freqToNorm(val, slider) {
-    const min = parseFloat(slider.min), max = parseFloat(slider.max);
-    return 0.08 + ((val - min) / (max - min)) * 0.7;
-  }
-
-  function drawCrossover(freqNorm) {
-    const w = xoverCanvas.width, h = xoverCanvas.height;
-    xctx.clearRect(0, 0, w, h);
-    const low = styleVar("--low"), high = styleVar("--high"), grid = styleVar("--divider");
-
-    xctx.strokeStyle = grid;
-    xctx.lineWidth = 1;
-    for (let i = 1; i < 3; i++) {
-      const y = (h / 3) * i;
-      xctx.beginPath(); xctx.moveTo(0, y); xctx.lineTo(w, y); xctx.stroke();
-    }
-
-    const cx = freqNorm * w;
-
-    xctx.strokeStyle = low; xctx.lineWidth = 2;
-    xctx.beginPath();
-    for (let x = 0; x <= w; x++) {
-      const t = (x - cx) / (w * 0.18);
-      const y = h * 0.52 - (h * 0.36) / (1 + Math.exp(t));
-      if (x === 0) xctx.moveTo(x, y); else xctx.lineTo(x, y);
-    }
-    xctx.stroke();
-
-    xctx.strokeStyle = high; xctx.lineWidth = 2;
-    xctx.beginPath();
-    for (let x = 0; x <= w; x++) {
-      const t = (x - cx) / (w * 0.18);
-      const y = h * 0.52 - (h * 0.36) / (1 + Math.exp(-t));
-      if (x === 0) xctx.moveTo(x, y); else xctx.lineTo(x, y);
-    }
-    xctx.stroke();
-
-    xctx.strokeStyle = styleVar("--text-tertiary");
-    xctx.setLineDash([3, 3]); xctx.lineWidth = 1;
-    xctx.beginPath(); xctx.moveTo(cx, 0); xctx.lineTo(cx, h); xctx.stroke();
-    xctx.setLineDash([]);
   }
 
   // ---------------------------------------------------------------------
@@ -630,17 +547,10 @@
   // Full dashboard render from state
   // ---------------------------------------------------------------------
 
-  let xoverInitialized = false;
-
   function renderDashboard(state) {
     captureLabel.textContent = state.capture_label || "Broadcasting System Audio";
 
-    if (document.activeElement !== masterVolumeEl) {
-      masterVolumeEl.value = Math.round((state.master_volume ?? 0.78) * 100);
-    }
-
     masterRoleToggle.checked = !!state.master_plays;
-    if (document.activeElement !== compressToggle) compressToggle.checked = !!state.compress;
 
     const addr = state.addr || "";
     // The backend already includes the scheme (http:// or https://); only add
@@ -664,14 +574,6 @@
     const clients = state.clients || [];
     renderDeviceList(clients, state.master_plays);
     renderRoom(clients, state.master_plays);
-
-    if (!xoverInitialized || document.activeElement !== xoverSlider) {
-      const hz = state.crossover_hz ?? 220;
-      xoverSlider.value = hz;
-      xoverReadout.textContent = hz;
-      drawCrossover(freqToNorm(hz, xoverSlider));
-      xoverInitialized = true;
-    }
 
     const bufferSlider2 = document.getElementById("bufferSlider");
     const bufferReadout2 = document.getElementById("bufferReadout");

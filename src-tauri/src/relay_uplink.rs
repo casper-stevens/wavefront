@@ -163,8 +163,10 @@ async fn connect_and_run(
                         if wall_now_ms() - chunk.capture_ts_ms > buffer_ms as f64 {
                             continue;
                         }
-                        let compress = state.lock().compress;
-                        let frame = encode_audio_frame(&chunk, compress, opus.as_mut());
+                        let frame = encode_audio_frame(&chunk, opus.as_mut());
+                        if frame.is_empty() {
+                            continue; // encode failed this chunk — skip it
+                        }
                         if write.send(Message::Binary(frame)).await.is_err() {
                             break;
                         }
@@ -306,41 +308,27 @@ fn handle_relay_text(txt: &str, state: &SharedState) {
     }
 }
 
-/// Encodes an audio chunk into a binary wire frame. Header (12 bytes): kind
-/// (0x01), flags (bit0 = 1 → Opus payload, else 24kHz s16 PCM), u16 reserved,
-/// f64 master capture timestamp. The relay re-stamps play_at but preserves the
-/// flags byte so clients know how to decode. `master_ts` being the raw capture
-/// clock is what makes seamless sub-buffer reconnect recovery possible.
-fn encode_audio_frame(
-    chunk: &AudioChunk,
-    compress: bool,
-    opus: Option<&mut OpusEncoder>,
-) -> Vec<u8> {
+/// Encodes an audio chunk into an Opus wire frame. Header (12 bytes): kind
+/// (0x01), flags (bit0 = 1, Opus), u16 reserved, f64 master capture timestamp.
+/// The relay re-stamps play_at but preserves the flags byte. Returns an empty
+/// Vec if encoding fails (caller skips the chunk).
+fn encode_audio_frame(chunk: &AudioChunk, opus: Option<&mut OpusEncoder>) -> Vec<u8> {
     let master_ts = chunk.capture_ts_ms;
-
-    // Try Opus when requested and available; fall back to PCM on any error.
-    if compress {
-        if let Some(enc) = opus {
-            let mut out = [0u8; 4000];
-            if let Ok(n) = enc.encode(&chunk.pcm, &mut out) {
-                let mut buf = Vec::with_capacity(12 + n);
-                buf.push(0x01u8);
-                buf.push(0x01u8); // flags: Opus
-                buf.extend_from_slice(&0u16.to_le_bytes());
-                buf.extend_from_slice(&master_ts.to_le_bytes());
-                buf.extend_from_slice(&out[..n]);
-                return buf;
-            }
-        }
-    }
-
-    let mut buf = Vec::with_capacity(12 + chunk.pcm.len() * 2);
+    let enc = match opus {
+        Some(e) => e,
+        None => return Vec::new(),
+    };
+    let mut out = [0u8; 4000];
+    let n = match enc.encode(&chunk.pcm, &mut out) {
+        Ok(n) => n,
+        Err(_) => return Vec::new(),
+    };
+    let mut buf = Vec::with_capacity(12 + n);
     buf.push(0x01u8);
-    buf.push(0x00u8); // flags: PCM
+    buf.push(0x01u8); // flags: Opus
     buf.extend_from_slice(&0u16.to_le_bytes());
     buf.extend_from_slice(&master_ts.to_le_bytes());
-    for s in &chunk.pcm {
-        buf.extend_from_slice(&s.to_le_bytes());
-    }
+    buf.extend_from_slice(&out[..n]);
     buf
 }
+

@@ -8,13 +8,9 @@
  */
 
 (function () {
-  const SAMPLE_RATE = 24000; // wire stream rate (half-rate to save bandwidth)
-  const FRAMES_PER_CHUNK = 480; // 20ms at 24kHz
   const HEADER_BYTES = 12;
-  const PAYLOAD_BYTES = FRAMES_PER_CHUNK * 2 * 2; // stereo s16le
-  const FRAME_BYTES = HEADER_BYTES + PAYLOAD_BYTES;
   const Q_BUTTERWORTH = 0.70710678;
-  const SYNC_SAMPLES = 15;
+  const CHUNK_SEC = 0.02; // 20ms audio per chunk
   const PING_INTERVAL_MS = 500; // frequent pings sharpen the min-RTT offset estimate
   const RECONNECT_MIN_MS = 1000;
   const RECONNECT_MAX_MS = 10000;
@@ -88,7 +84,7 @@
   let playHead = 0;
   let badSince = 0; // audioCtx time the cursor first went off-target (watchdog)
   let ctxRate = 48000; // audio context's native sample rate (set at join)
-  const CHUNK_DUR = FRAMES_PER_CHUNK / SAMPLE_RATE; // 0.02s
+
 
   // Smoothed offset between the audio clock and performance.now() (seconds):
   // ctxTime ≈ perfMs/1000 + ctxPerfK. Reading audioContext.currentTime raw each
@@ -172,14 +168,6 @@
     statusPill.className = "pill " + cls;
   }
 
-  function median(arr) {
-    if (arr.length === 0) return 0;
-    const sorted = arr.slice().sort((a, b) => a - b);
-    const mid = Math.floor(sorted.length / 2);
-    if (sorted.length % 2 === 0) return (sorted[mid - 1] + sorted[mid]) / 2;
-    return sorted[mid];
-  }
-
   // ---------------------------------------------------------------------
   // Audio graph setup
   // ---------------------------------------------------------------------
@@ -259,9 +247,6 @@
     }
 
     rewirePan(cfg.pan || "mid");
-    // The persistent worklet node must follow role changes (full=passthrough,
-    // sub/tweeter=filter) since it isn't reconnected per chunk.
-    if (workletReady) rewireWorkletRole(cfg.role || "full");
   }
 
   function connectSourceForRole(source, role) {
@@ -273,22 +258,12 @@
   }
 
   // ---------------------------------------------------------------------
-  // Optional AudioWorklet playback engine (experimental, opt-in via
-  // ?engine=worklet). Moves sample output onto the dedicated audio thread via
-  // a ring buffer, eliminating the per-chunk AudioBufferSourceNode churn/GC
-  // that can jank weak/mobile devices. Falls back automatically to the proven
-  // per-chunk scheduler if setup fails. Sync is a buffer-level control loop:
-  // the main thread feeds PCM and steers the worklet's resample `rate` so the
-  // sample leaving the ring is the one whose shared-clock play_at is due now
-  // (accounting for output latency).
-  const USE_WORKLET = /[?&]engine=worklet\b/.test(location.search);
-  let workletNode = null;
-  let workletReady = false;
-  let opusDecoder = null; // WebCodecs AudioDecoder for compressed frames
+  // Opus decoder (WebCodecs)
+  // ---------------------------------------------------------------------
+  let opusDecoder = null; // WebCodecs AudioDecoder
 
-  // Set up an Opus decoder if the master ever sends compressed frames. Raw
-  // packets, decoded via WebCodecs (no external WASM). Absent on browsers
-  // without WebCodecs AudioDecoder — those simply can't play Opus frames.
+  // Decode raw Opus packets via WebCodecs (no external WASM). Absent on browsers
+  // without WebCodecs AudioDecoder — those cannot play (Opus is the only codec).
   function setupOpusDecoder() {
     if (typeof AudioDecoder === "undefined") return;
     try {
@@ -300,132 +275,6 @@
     } catch (e) {
       opusDecoder = null;
     }
-  }
-  let wlWrittenFrames = 0;      // frames (ctxRate) written to the worklet ring
-  let wlAvailable = 0;          // last reported buffered frames in the ring
-  let wlWriteHeadPlayAtMs = 0;  // shared-clock play_at at the write head
-  let wlPrimed = false;         // has the initial silence lead been laid down?
-
-  const WORKLET_SRC = `
-class WavefrontPlayer extends AudioWorkletProcessor {
-  static get parameterDescriptors() {
-    return [{ name: 'rate', defaultValue: 1, minValue: 0.95, maxValue: 1.05, automationRate: 'k-rate' }];
-  }
-  constructor() {
-    super();
-    this.cap = sampleRate * 3;            // ~3s ring (frames)
-    this.L = new Float32Array(this.cap);
-    this.R = new Float32Array(this.cap);
-    this.w = 0; this.r = 0; this.avail = 0; // write idx, read pos (frac), frames avail
-    this.count = 0;
-    this.port.onmessage = (e) => {
-      const m = e.data;
-      if (m.type === 'pcm') {
-        const l = m.l, rr = m.r, n = l.length;
-        for (let i = 0; i < n; i++) {
-          this.L[this.w] = l[i]; this.R[this.w] = rr[i];
-          this.w = (this.w + 1) % this.cap;
-          if (this.avail < this.cap) this.avail++; else this.r = (this.r + 1) % this.cap;
-        }
-      } else if (m.type === 'silence') {
-        let n = m.n;
-        while (n-- > 0) {
-          this.L[this.w] = 0; this.R[this.w] = 0;
-          this.w = (this.w + 1) % this.cap;
-          if (this.avail < this.cap) this.avail++; else this.r = (this.r + 1) % this.cap;
-        }
-      } else if (m.type === 'flush') {
-        this.w = 0; this.r = 0; this.avail = 0;
-      }
-    };
-  }
-  process(_inputs, outputs, params) {
-    const out = outputs[0], oL = out[0], oR = out[1], n = oL.length;
-    const rate = params.rate.length > 0 ? params.rate[0] : 1;
-    for (let i = 0; i < n; i++) {
-      if (this.avail < 2) { oL[i] = 0; oR[i] = 0; continue; }
-      const i0 = Math.floor(this.r), frac = this.r - i0;
-      const i1 = (i0 + 1) % this.cap;
-      oL[i] = this.L[i0] * (1 - frac) + this.L[i1] * frac;
-      oR[i] = this.R[i0] * (1 - frac) + this.R[i1] * frac;
-      this.r += rate;
-      while (this.r >= this.cap) this.r -= this.cap;
-      const consumed = rate; // approx frames consumed this sample-step
-      this.avail -= consumed;
-      if (this.avail < 0) this.avail = 0;
-    }
-    if ((this.count++ & 7) === 0) this.port.postMessage({ type: 'status', avail: this.avail });
-    return true;
-  }
-}
-registerProcessor('wavefront-player', WavefrontPlayer);
-`;
-
-  async function setupWorklet() {
-    if (!USE_WORKLET || !audioCtx.audioWorklet) return false;
-    try {
-      const url = URL.createObjectURL(new Blob([WORKLET_SRC], { type: "application/javascript" }));
-      await audioCtx.audioWorklet.addModule(url);
-      URL.revokeObjectURL(url);
-      workletNode = new AudioWorkletNode(audioCtx, "wavefront-player", { outputChannelCount: [2] });
-      workletNode.port.onmessage = function (e) {
-        if (e.data && e.data.type === "status") wlAvailable = e.data.avail;
-      };
-      connectSourceForRole(workletNode, currentConfig.role);
-      workletReady = true;
-      return true;
-    } catch (e) {
-      workletReady = false;
-      return false;
-    }
-  }
-
-  function rewireWorkletRole(role) {
-    if (!workletNode) return;
-    safeDisconnect(workletNode);
-    connectSourceForRole(workletNode, role);
-  }
-
-  // Feed one decoded chunk (context-rate planar L/R) into the worklet ring and
-  // steer the resample rate to keep playback aligned to the shared clock.
-  function feedWorklet(chL, chR, playAtMs, nowMs) {
-    const bufferSec = Math.max(0.1, (currentConfig.buffer_ms || 500) / 1000);
-    const outDelayMs =
-      Math.min(0.5, (audioCtx.baseLatency || 0) + (audioCtx.outputLatency || 0)) * 1000;
-
-    if (!wlPrimed) {
-      // Lay down an initial silence lead so the first real sample is heard at
-      // its target time (buffer_ms from now, in shared clock).
-      const leadFrames = Math.max(0, Math.round(bufferSec * ctxRate));
-      if (leadFrames > 0) workletNode.port.postMessage({ type: "silence", n: leadFrames });
-      wlWrittenFrames = leadFrames;
-      wlPrimed = true;
-    }
-
-    workletNode.port.postMessage({ type: "pcm", l: chL, r: chR }, [chL.buffer, chR.buffer]);
-    wlWrittenFrames += chL.length;
-    wlWriteHeadPlayAtMs = playAtMs + (chL.length / ctxRate) * 1000;
-
-    // Buffer-level control: the sample leaving the ring now is heard after
-    // outDelay, so it should carry play_at == relayNow + outDelay. Its actual
-    // play_at = writeHead - available. Steer rate to null the error.
-    const relayNowMs = nowMs + offsetNow(nowMs);
-    const leavingPlayAtMs = wlWriteHeadPlayAtMs - (wlAvailable / ctxRate) * 1000;
-    const errMs = leavingPlayAtMs - (relayNowMs + outDelayMs);
-    const rate = Math.max(0.997, Math.min(1.003, 1 + 0.0005 * errMs));
-    try {
-      workletNode.parameters.get("rate").setValueAtTime(rate, audioCtx.currentTime);
-    } catch (e) { /* ignore */ }
-
-    if (outLatVal) outLatVal.textContent = Math.round(outDelayMs) + " ms";
-    updateReliability(audioCtx.currentTime);
-  }
-
-  function flushWorklet() {
-    if (workletNode) workletNode.port.postMessage({ type: "flush" });
-    wlPrimed = false;
-    wlWrittenFrames = 0;
-    wlAvailable = 0;
   }
 
   // ---------------------------------------------------------------------
@@ -547,8 +396,7 @@ registerProcessor('wavefront-player', WavefrontPlayer);
     return { chL, chR };
   }
 
-  // Dispatch a wire frame by codec: raw 24kHz PCM or Opus (WebCodecs). Both
-  // paths converge on scheduleCtxChunk with context-rate planar audio.
+  // Decode an Opus wire frame via WebCodecs; the output callback schedules it.
   function handleAudioFrame(buffer) {
     if (buffer.byteLength < HEADER_BYTES) return;
     const view = new DataView(buffer);
@@ -559,36 +407,17 @@ registerProcessor('wavefront-player', WavefrontPlayer);
       if (pendingFrames.length < 800) pendingFrames.push(buffer);
       return;
     }
-    const flags = view.getUint8(1);
+    if (!opusDecoder) return; // no WebCodecs on this browser -> cannot play
     const playAt = view.getFloat64(4, true);
-
-    if (flags & 0x01) {
-      // Opus: hand the packet to the async WebCodecs decoder (output callback
-      // finishes the job). Carry playAt in the chunk timestamp (µs).
-      if (!opusDecoder) return; // no decoder on this browser -> can't play Opus
-      try {
-        opusDecoder.decode(
-          new EncodedAudioChunk({
-            type: "key",
-            timestamp: Math.round(playAt * 1000),
-            data: new Uint8Array(buffer, HEADER_BYTES),
-          })
-        );
-      } catch (e) { /* decoder not ready / bad packet */ }
-      return;
-    }
-
-    // Raw 24kHz s16 stereo PCM.
-    if (buffer.byteLength < FRAME_BYTES) return;
-    const samples = new Int16Array(buffer, HEADER_BYTES, FRAMES_PER_CHUNK * 2);
-    const srcL = new Float32Array(FRAMES_PER_CHUNK);
-    const srcR = new Float32Array(FRAMES_PER_CHUNK);
-    for (let i = 0; i < FRAMES_PER_CHUNK; i++) {
-      srcL[i] = samples[i * 2] / 32768;
-      srcR[i] = samples[i * 2 + 1] / 32768;
-    }
-    const r = resampleToCtx(srcL, srcR, SAMPLE_RATE);
-    scheduleCtxChunk(r.chL, r.chR, playAt);
+    try {
+      opusDecoder.decode(
+        new EncodedAudioChunk({
+          type: "key",
+          timestamp: Math.round(playAt * 1000), // carry playAt in the timestamp
+          data: new Uint8Array(buffer, HEADER_BYTES),
+        })
+      );
+    } catch (e) { /* decoder not ready / bad packet */ }
   }
 
   // WebCodecs Opus decode callback: convert to planar Float32 and schedule.
@@ -615,12 +444,6 @@ registerProcessor('wavefront-player', WavefrontPlayer);
 
   // Schedule one context-rate stereo chunk against the shared clock.
   function scheduleCtxChunk(chL, chR, playAt) {
-    // Worklet engine (opt-in): hand the PCM to the audio thread and return.
-    if (workletReady) {
-      feedWorklet(chL, chR, playAt, performance.now());
-      return;
-    }
-
     const outFrames = chL.length;
     const audioBuffer = audioCtx.createBuffer(2, outFrames, ctxRate);
     audioBuffer.getChannelData(0).set(chL);
@@ -695,7 +518,7 @@ registerProcessor('wavefront-player', WavefrontPlayer);
     updateReliability(now);
 
     const startAt = playHead;
-    playHead += CHUNK_DUR / rate; // buffer occupies CHUNK_DUR/rate of real time
+    playHead += CHUNK_SEC / rate; // buffer occupies CHUNK_DUR/rate of real time
 
     const source = audioCtx.createBufferSource();
     source.buffer = audioBuffer;
@@ -737,11 +560,7 @@ registerProcessor('wavefront-player', WavefrontPlayer);
       // empty (fresh join, or a drop that outlasted the buffer). A reconnecting
       // client that still has buffered audio must NOT be backfilled or it would
       // double-schedule and echo against what's already queued.
-      const bufAhead = workletReady
-        ? wlAvailable / ctxRate
-        : audioCtx
-          ? playHead - audioCtx.currentTime
-          : 0;
+      const bufAhead = audioCtx ? playHead - audioCtx.currentTime : 0;
       const needBackfill = bufAhead < 0.5;
       ws.send(JSON.stringify({
         type: "hello",
@@ -916,7 +735,6 @@ registerProcessor('wavefront-player', WavefrontPlayer);
         ctxPerfK = null;
         minRtt = null;
         offsetInit = false; // re-estimate the clock after the gap
-        flushWorklet();
         markUnreliable(1.0); // stay silent until re-locked
         audioCtx.resume().catch(function () {});
       } else if (st === "running") {
@@ -947,10 +765,6 @@ registerProcessor('wavefront-player', WavefrontPlayer);
 
     buildAudioGraph();
     setupOpusDecoder();
-    if (USE_WORKLET) {
-      const ok = await setupWorklet();
-      if (!ok) console.warn("wavefront: worklet engine unavailable, using scheduler");
-    }
     requestWakeLock();
 
     joinScreen.style.display = "none";

@@ -165,6 +165,17 @@ async fn handle_socket(mut socket: WebSocket, ctx: ServerCtx) {
     let mut audio_rx = ctx.capture.subscribe();
     let buffer_ms_atomic = AtomicU64::new(buffer_ms as u64);
 
+    // Per-connection Opus encoder (24kHz stereo, matching capture).
+    let mut opus = audiopus::coder::Encoder::new(
+        audiopus::SampleRate::Hz24000,
+        audiopus::Channels::Stereo,
+        audiopus::Application::Audio,
+    )
+    .ok();
+    if let Some(enc) = opus.as_mut() {
+        let _ = enc.set_bitrate(audiopus::Bitrate::BitsPerSecond(64_000));
+    }
+
     loop {
         tokio::select! {
             incoming = socket.recv() => {
@@ -200,7 +211,7 @@ async fn handle_socket(mut socket: WebSocket, ctx: ServerCtx) {
                             break;
                         }
                     }
-                    Some(ClientMsg::Disconnect) | None => break,
+                    None => break,
                 }
             }
             audio = audio_rx.recv() => {
@@ -215,7 +226,10 @@ async fn handle_socket(mut socket: WebSocket, ctx: ServerCtx) {
                                 *s = (*s as f32 * volume).clamp(i16::MIN as f32, i16::MAX as f32) as i16;
                             }
                         }
-                        let frame = encode_audio_frame(&chunk, bm);
+                        let frame = encode_audio_frame(&chunk, bm, &mut opus);
+                        if frame.is_empty() {
+                            continue;
+                        }
                         if socket.send(Message::Binary(frame)).await.is_err() {
                             break;
                         }
@@ -261,16 +275,28 @@ fn pan_str(pan: crate::state::Pan) -> &'static str {
     }
 }
 
-/// Encodes an audio chunk into the binary wire frame described in PROTOCOL.md.
-fn encode_audio_frame(chunk: &AudioChunk, buffer_ms: u32) -> Vec<u8> {
+/// Encodes an audio chunk into an Opus wire frame (PROTOCOL.md; flags bit0=1).
+/// Returns an empty Vec on encode failure (caller skips the chunk).
+fn encode_audio_frame(
+    chunk: &AudioChunk,
+    buffer_ms: u32,
+    opus: &mut Option<audiopus::coder::Encoder>,
+) -> Vec<u8> {
     let play_at = chunk.capture_ts_ms + buffer_ms as f64;
-    let mut buf = Vec::with_capacity(12 + chunk.pcm.len() * 2);
+    let enc = match opus {
+        Some(e) => e,
+        None => return Vec::new(),
+    };
+    let mut out = [0u8; 4000];
+    let n = match enc.encode(&chunk.pcm, &mut out) {
+        Ok(n) => n,
+        Err(_) => return Vec::new(),
+    };
+    let mut buf = Vec::with_capacity(12 + n);
     buf.push(0x01u8); // frame kind = audio
-    buf.push(0u8); // flags
+    buf.push(0x01u8); // flags: Opus
     buf.extend_from_slice(&0u16.to_le_bytes()); // reserved
     buf.extend_from_slice(&play_at.to_le_bytes());
-    for s in &chunk.pcm {
-        buf.extend_from_slice(&s.to_le_bytes());
-    }
+    buf.extend_from_slice(&out[..n]);
     buf
 }

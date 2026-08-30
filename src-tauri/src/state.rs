@@ -58,7 +58,6 @@ impl Default for ClientConfig {
 #[derive(Debug, Clone)]
 pub enum ClientMsg {
     Config(ClientConfig),
-    Disconnect,
 }
 
 /// Registry entry for a connected client (native app or browser tab).
@@ -149,9 +148,6 @@ pub struct AppState {
     pub buffer_ms: u32,
     pub master_volume: f32,
     pub master_plays: bool,
-    /// Opus-compress the stream (huge bandwidth cut for marginal networks).
-    /// Off = 24kHz PCM (the proven path); on = per-frame Opus.
-    pub compress: bool,
     pub capture_source: String,
     pub warnings: Vec<String>,
     pub client_addr: Option<String>,
@@ -180,7 +176,6 @@ impl Default for AppState {
             buffer_ms: 1000,
             master_volume: 1.0,
             master_plays: true,
-            compress: true,
             capture_source: String::new(),
             warnings: Vec::new(),
             client_addr: None,
@@ -200,7 +195,6 @@ pub struct StateView {
     pub buffer_ms: u32,
     pub master_volume: f32,
     pub master_plays: bool,
-    pub compress: bool,
     pub capture_source: String,
     pub warnings: Vec<String>,
     /// Join URL (http://<lan-ip>:8927) when hosting.
@@ -237,7 +231,6 @@ impl AppState {
             buffer_ms: self.buffer_ms,
             master_volume: self.master_volume,
             master_plays: self.master_plays,
-            compress: self.compress,
             capture_source: self.capture_source.clone(),
             warnings: self.warnings.clone(),
             addr,
